@@ -78,6 +78,33 @@ def main():
                 doc[-1].get_pixmap(matrix=fitz.Matrix(1.3, 1.3)).save(out / f"fragment-{i}.png")
             results[f"fragment-{i}"] = {"status": "passed", "pdf": str(pdf), "pages": pages,
                  "resume_new_processes": 0, "polish": False, "pdf_sha256": sha_file(pdf)}
+        # Ordinary book route uses grouped paragraph envelopes by default.
+        # Keep this fixture synthetic even when optional OCR excerpts are given.
+        source = out / "grouped-source.md"
+        atomic_text(source, "# Mechanics\n\nThe equation $F=ma$ defines force.\n\n"
+                           "The energy is $E=mc^2$.\n")
+        job = out / "job-grouped-book"
+        created = pipeline.initialize(source, job, dict(cfg, source_lang="English",
+                                      group_chars=900, split_chars=900))
+        with (out / "job-grouped-book.log").open("wb") as stream:
+            rc = subprocess.run([sys.executable, "-X", "utf8", str(ROOT / "scripts/pipeline.py"),
+                                 "run", str(job)], stdout=stream, stderr=subprocess.STDOUT,
+                                 timeout=1500).returncode
+        state = pipeline.status(job)
+        if rc or state["status"] != "done":
+            results["grouped-book"] = {"status": "failed", "rc": rc, "state": state}
+        else:
+            work = job / "work" / created["books"][0]["id"]
+            receipt = json.loads((work / "work/book.ru.masked.md.report.json").read_text(encoding="utf-8"))
+            assert receipt["request_config"]["paragraph_protocol"] == "paragraph-ids-v1"
+            assert len(receipt["paragraph_coverage"]) == 3 and receipt["kept_source"] == 0
+            before = {p.name: sha_file(p) for p in (job / "logs").glob("*.log")}
+            assert pipeline.run_job(job) == 0
+            assert before == {p.name: sha_file(p) for p in (job / "logs").glob("*.log")}
+            pdf = work / "grouped-source.ru.pdf"
+            results["grouped-book"] = {"status": "passed", "pdf": str(pdf),
+                "pdf_sha256": sha_file(pdf), "covered_paragraphs": 3,
+                "resume_new_processes": 0, "polish": False}
     finally:
         if server:
             server.shutdown()

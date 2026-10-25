@@ -33,7 +33,16 @@ SUITES = [
     "test_packaging.py",
     "test_luna_pilot_regressions.py",
     "test_complex_ocr_regressions.py",
+    "test_source_preservation.py",
 ]
+
+PYTEST_SUITES = ["test_build_resume.py", "test_longtable_layout.py", "test_atlas_translation.py",
+                 "test_attempt_journal.py", "test_paragraph_identity.py",
+                 "test_content_coverage.py", "test_route_request_settings.py",
+                 "test_translation_attempt_journal.py", "test_book_coverage_integration.py",
+                 "test_background_run.py", "test_windows_tasks.py", "test_lmstudio_runtime.py",
+                 "test_managed_gpu_handoff.py", "test_managed_model_guard.py",
+                 "test_pipeline_state_diagnostics.py", "test_pdf_geometry.py"]
 
 
 def main():
@@ -57,6 +66,12 @@ def main():
             [sys.executable, "-X", "utf8", str(TESTS / s)]).returncode
         if rc:
             failed.append(s)
+
+    print("\n===== Pipeline regression tests =====", flush=True)
+    rc = subprocess.run([sys.executable, "-X", "utf8", "-m", "pytest", "-q",
+                         *[str(TESTS / name) for name in PYTEST_SUITES]]).returncode
+    if rc:
+        failed.append("Pipeline regression tests")
 
     print("\n" + "=" * 50)
     if failed:
