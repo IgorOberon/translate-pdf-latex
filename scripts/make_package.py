@@ -26,10 +26,10 @@ NAME = "Конвейер-перевода-книг"
 SKILL_NAME = "translate-pdf-latex"
 DIRS = ("scripts", "assets", "skeleton", "tests")
 DOCS = [
-    "LICENSE", ".gitignore", "CONTRIBUTING.md", "SECURITY.md", "THIRD_PARTY.md",
-    "docs/VALIDATION.md", "docs/COMPANION_SKILLS.md",
+    "docs/COMPANION_SKILLS.md",
     "AGENTS.md", "PIPELINE_REFERENCE.md", "ПРОМПТ_РУЧНЫЕ_СТАДИИ.md",
     "docs/LOCAL_AGENT.md", "docs/ARTICLE_IDEAS.md",
+    "docs/BOOK_PROFILES.md", "docs/BACKGROUND_RUN.md", "docs/OPENCODE_LESSONS.md",
     "ЧИТАТЬ_ПЕРВЫМ.md", "УСТАНОВКА.md", "ДЛЯ_ИИ_АГЕНТА.md",
     "install.ps1", "requirements.txt", "requirements-extra.txt",
     "README.md", "АГЕНТ.md", "ПРОМПТ.md", "SKILL.md",
@@ -46,6 +46,13 @@ DOCS = [
 ]
 # Explicitly reviewed new source files, before their first git commit.
 ADDITIONS = {
+    "scripts/background_run.py", "scripts/windows_tasks.py", "scripts/windows_task.ps1",
+    "scripts/lmstudio_runtime.py", "tests/test_background_run.py",
+    "scripts/managed_model_guard.py", "tests/test_managed_model_guard.py",
+    "tests/test_pipeline_state_diagnostics.py", "tests/test_pdf_geometry.py",
+    "tests/test_windows_tasks.py", "tests/test_lmstudio_runtime.py",
+    "tests/test_managed_gpu_handoff.py",
+    "tests/run_detached_integration.py", "tests/run_lmstudio_detached_integration.py",
     "scripts/prepare_mineru.py", "tests/test_mineru_structure.py",
     "tests/test_installation.py",
     "scripts/verify_package.py", "assets/quickstart.md",
@@ -54,6 +61,14 @@ ADDITIONS = {
     "scripts/provenance.py", "scripts/request_plan.py", "scripts/build_release.py",
     "scripts/editorial.py", "scripts/glossary_selection.py",
     "scripts/agent_exchange.py",
+    "scripts/tex_logs.py", "scripts/source_preservation.py",
+    "scripts/attempt_journal.py", "scripts/paragraph_units.py",
+    "scripts/content_coverage.py", "scripts/request_budget.py",
+    "tests/test_attempt_journal.py", "tests/test_paragraph_identity.py",
+    "tests/test_content_coverage.py", "tests/test_route_request_settings.py",
+    "tests/test_translation_attempt_journal.py", "tests/test_book_coverage_integration.py",
+    "tests/test_build_resume.py", "tests/test_longtable_layout.py",
+    "tests/test_atlas_translation.py", "tests/test_source_preservation.py",
     "tests/test_integrity_regressions.py", "tests/run_integrations.py",
     "tests/test_packaging.py",
     "tests/test_luna_pilot_regressions.py",

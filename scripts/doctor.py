@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from paths import (ROOT, lms, mineru, marker, pandoc, tesseract,  # noqa: E402
                    venv_python, xelatex)
 from endpoint_policy import model_opener
+from tex_logs import read_tex_log
 OPENER = model_opener()
 
 OK, WARN, FAIL = "OK  ", "ЧАСТЬ", "НЕТ "
@@ -164,7 +165,7 @@ def check_latex_build(exe, ver):
             return add(FAIL, "xelatex собирает", str(e)[:60],
                        "проверьте установку TeX")
         log = (d / "main.log")
-        text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+        text = read_tex_log(log) if log.exists() else ""
         missing = text.count("Missing character")
         if result.returncode != 0 or re.search(r"^!", text, re.M) or not (d / "main.pdf").exists():
             head = [ln for ln in text.splitlines() if ln.startswith("!")][:1]

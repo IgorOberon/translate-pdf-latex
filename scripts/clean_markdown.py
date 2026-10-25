@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Sanitize OCR-extracted book markdown before translation/typesetting.
 
-Rules (all ON by default, each can be switched off):
+The CLI preserves exact content and whitespace by default and records
+replayable coverage. Reviewed exact removals and optional plain-prose blank-line
+normalization are supplied through --book-profile. The older clean_text() rule API below remains available
+for isolated diagnostics/regressions, not as the publication cleaning policy.
+
+Legacy clean_text() rules (not CLI defaults):
   strip-toc           cut the book's own recognized table of contents: a block
                       of >=5 consecutive lines "text [leaders|spaces] NUMBER"
                       starting in the first --toc-zone share of the document;
@@ -50,9 +55,6 @@ from pathlib import Path
 # консоли cp1251 уронить печать
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-print(">> clean_markdown.py v2 (hfill statement numbers, unicode math)",
-      flush=True)
 
 TOC_NAMES = ("Оглавление", "Содержание", "Contents", "Table of Contents",
              "СОДЕРЖАНИЕ", "ОГЛАВЛЕНИЕ", "CONTENTS")
@@ -986,6 +988,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="markdown in")
     ap.add_argument("output", help="markdown out")
+    ap.add_argument("--book-profile", help="schema 1 JSON with exact reviewed cleaning decisions")
     ap.add_argument("--no-repair-math", action="store_true")
     ap.add_argument("--no-strip-cjk", action="store_true")
     ap.add_argument("--no-strip-ocr-garbage", action="store_true")
@@ -998,7 +1001,8 @@ def main():
     ap.add_argument("--no-attach-eq-tags", action="store_true")
     ap.add_argument("--no-normalize-unicode-math", action="store_true")
     ap.add_argument("--no-strip-dup-runs", action="store_true")
-    ap.add_argument("--no-normalize-blank", action="store_true")
+    ap.add_argument("--no-normalize-blank", action="store_true",
+                    help="preserve blank lines even if profile explicitly enables normalization (default: preserve)")
     ap.add_argument("--toc-zone", type=float, default=0.10,
                     help="share of the document where a book TOC may start (0.10)")
     ap.add_argument("--min-repeats", type=int, default=8,
@@ -1011,52 +1015,26 @@ def main():
     ap.add_argument("--report", default=None, help="write JSON report here")
     a = ap.parse_args()
 
+    from content_coverage import clean_with_coverage, load_book_profile
+
     src, dst = Path(a.input), Path(a.output)
-    text = src.read_text(encoding="utf-8")
-    opts = {"repair_math": not a.no_repair_math,
-            "strip_cjk": not a.no_strip_cjk,
-            "strip_ocr_garbage": not a.no_strip_ocr_garbage,
-            "strip_toc": not a.no_strip_toc,
-            "strip_index": not a.no_strip_index,
-            "clean_headings": not a.no_clean_headings,
-            "strip_running_heads": not a.no_strip_running_heads,
-            "strip_pagehead_headings": not a.no_strip_pagehead_headings,
-            "demote_bib_headings": not a.no_demote_bib_headings,
-            "attach_eq_tags": not a.no_attach_eq_tags,
-            "normalize_unicode_math": not a.no_normalize_unicode_math,
-            "strip_dup_runs": not a.no_strip_dup_runs,
-            "normalize_blank": not a.no_normalize_blank,
-            "toc_zone": a.toc_zone, "min_repeats": a.min_repeats,
-            "dup_min_paras": a.dup_min_paras, "dup_min_chars": a.dup_min_chars}
-    (cleaned, report, removed_toc, removed_index, removed_cjk,
-     removed_dup, removed_ocr) = clean_text(text, opts)
-    dst.write_text(cleaned, encoding="utf-8")
-    if removed_ocr:
-        audit = dst.with_suffix(".removed_ocr.md")
-        audit.write_text("\n".join(removed_ocr) + "\n", encoding="utf-8")
-        report["strip_ocr_garbage"]["audit_file"] = str(audit)
-    if removed_dup:
-        audit = dst.with_suffix(".removed_dup.md")
-        audit.write_text("\n".join(removed_dup) + "\n", encoding="utf-8")
-        report["strip_dup_runs"]["audit_file"] = str(audit)
-    if removed_cjk:
-        audit = dst.with_suffix(".removed_cjk.md")
-        audit.write_text("\n".join(removed_cjk) + "\n", encoding="utf-8")
-        report["strip_cjk"]["audit_file"] = str(audit)
-    if removed_toc:
-        audit = dst.with_suffix(".removed_toc.md")
-        audit.write_text("\n".join(removed_toc) + "\n", encoding="utf-8")
-        report["strip_toc"]["audit_file"] = str(audit)
-    if removed_index:
-        audit = dst.with_suffix(".removed_index.md")
-        audit.write_text("\n".join(removed_index) + "\n", encoding="utf-8")
-        report["strip_index"]["audit_file"] = str(audit)
-    out = json.dumps(report, ensure_ascii=False, indent=2)
-    print(out)
-    if a.report:
-        Path(a.report).write_text(out + "\n", encoding="utf-8")
+    report_path = Path(a.report) if a.report else dst.with_suffix(".coverage.json")
+    try:
+        profile = load_book_profile(a.book_profile)
+        if a.no_normalize_blank:
+            profile.setdefault("cleaning", {})["normalize_blank"] = False
+        report = clean_with_coverage(src, dst, report_path, profile)
+    except (ValueError, OSError) as exc:
+        print(f"!! cleaning stopped: {exc}", file=sys.stderr)
+        return 4
+    print(json.dumps({"status": report["status"], "policy": report["policy"],
+                      "report": str(report_path),
+                      "before": report["before"]["counts"],
+                      "after": report["after"]["counts"],
+                      "decisions": len(report["decisions"])}, ensure_ascii=False))
     print(f">> written: {dst}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

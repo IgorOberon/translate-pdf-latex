@@ -4,7 +4,9 @@ No LLM controller needed. Fixed commands, local MT by default, no shell strings,
 no automatic polishing or provider fallback. Work is isolated from the source.
 """
 import argparse
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -24,13 +26,85 @@ BOOK_EXT = {".pdf", ".epub", ".fb2", ".docx", ".odt", ".html", ".htm", ".rst", "
 DEFAULTS = {"host": "http://localhost:1234", "model": "hy-mt2-7b", "mode": "hymt",
             "allow_remote": False, "polish": False, "parallel": 1,
             "extract": "auto", "source_lang": "English", "target_lang": "Russian",
-            "split_chars": 900, "context_per_request": 0, "parts": 100,
-            "timeout": 86400, "mineru_timeout": 3600, "title": "", "author": ""}
+            "split_chars": 900, "group_chars": 900, "layout": "compact", "context_per_request": 0, "parts": 100,
+            "timeout": 86400, "mineru_timeout": 3600, "title": "", "author": "", "keep_source": "",
+            "glossary_profile": "", "book_profile": ""}
 SKIP = {".git", "venv", ".venv", "__pycache__", ".tcache", "_skeleton_work", ".build-candidates", "build", "preview", ".sync-backups"}
 
 
 def read(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+class StateFileError(ValueError):
+    """Corrupt state is diagnostic evidence, never an instruction to reset it."""
+
+    def __init__(self, path, raw, error):
+        self.details = {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(),
+                        "bytes": len(raw), "error_type": type(error).__name__}
+        if isinstance(error, json.JSONDecodeError):
+            self.details.update(line=error.lineno, column=error.colno)
+        super().__init__(f"invalid pipeline state: {path}; bytes preserved; {error}")
+
+
+def _state_digest(value, label):
+    if (not isinstance(value, str) or len(value) != 64
+            or any(char not in "0123456789abcdefABCDEF" for char in value)):
+        raise ValueError(label + " must be a SHA-256 hex string")
+
+
+def _state_hashes(value, label):
+    if not isinstance(value, dict):
+        raise ValueError(label + " must be a path-to-hash object")
+    for path, digest in value.items():
+        if not isinstance(path, str) or not path:
+            raise ValueError(label + " must contain nonempty path strings")
+        _state_digest(digest, label + "." + path)
+
+
+def read_state(root):
+    path = Path(root) / STATE
+    raw = path.read_bytes()
+    try:
+        state = json.loads(raw.decode("utf-8"))
+        if (not isinstance(state, dict) or type(state.get("schema")) is not int
+                or state.get("schema") != 1):
+            raise ValueError("expected a schema=1 JSON object")
+        if state.get("status") not in {"ready", "running", "done", "needs_attention", "interrupted", "stale"}:
+            raise ValueError("unknown or missing pipeline status")
+        # Validate what resume/status consume before acquiring a lock or writing
+        # anything. Optional schema-1 fields and unknown metadata remain valid.
+        if "steps" in state:
+            if not isinstance(state["steps"], dict):
+                raise ValueError("steps must be an object")
+            for name, step in state["steps"].items():
+                if not isinstance(name, str) or not name or not isinstance(step, dict):
+                    raise ValueError("steps must map nonempty names to objects")
+                if "status" in step and not isinstance(step["status"], str):
+                    raise ValueError("step status must be a string: " + name)
+                if "outputs" in step:
+                    _state_hashes(step["outputs"], "steps." + name + ".outputs")
+        if "artifacts" in state:
+            _state_hashes(state["artifacts"], "artifacts")
+        for key in ("job_sha256", "code_sha256"):
+            if key in state:
+                _state_digest(state[key], key)
+        for key in ("pid", "child_pid"):
+            value = state.get(key)
+            if value is not None and (type(value) is not int or not 0 < value <= 0xFFFFFFFF):
+                raise ValueError(key + " must be a positive process ID or null")
+        for key in ("started", "child_started"):
+            value = state.get(key)
+            if value is not None:
+                try:
+                    valid = type(value) in (int, float) and value > 0 and math.isfinite(value)
+                except OverflowError:
+                    valid = False
+                if not valid:
+                    raise ValueError(key + " must be a finite positive process timestamp or null")
+        return state
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise StateFileError(path, raw, exc) from exc
 
 
 def copy_files(source, destination, files):
@@ -70,14 +144,20 @@ def validate_settings(cfg, route):
     for key in ("parallel", "parts", "timeout", "mineru_timeout"):
         if type(cfg[key]) is not int or cfg[key] <= 0:
             raise ValueError(key + " must be positive integer")
-    for key in ("split_chars", "context_per_request"):
+    for key in ("split_chars", "group_chars", "context_per_request"):
         if type(cfg[key]) is not int or cfg[key] < 0:
             raise ValueError(key + " must be nonnegative integer")
-    for key in ("model", "source_lang", "target_lang", "title", "author"):
+    if cfg["layout"] not in ("screen", "print", "compact"):
+        raise ValueError("layout must be screen, print or compact")
+    for key in ("model", "source_lang", "target_lang", "title", "author", "keep_source", "glossary_profile", "book_profile"):
         if not isinstance(cfg[key], str) or (key in ("model", "source_lang", "target_lang") and not cfg[key].strip()):
             raise ValueError(key + " must be a string")
     if cfg["polish"]:
         raise ValueError("dispatcher does not polish; explicitly use the optional polish workflow in КОНФИГУРАЦИИ.md")
+    if cfg["keep_source"] and route != "books":
+        raise ValueError("keep_source is currently supported for a single book job")
+    if cfg["book_profile"] and route != "books":
+        raise ValueError("book_profile is currently supported for a single book job")
     if route != "ocr" and (cfg["source_lang"] != "English" or cfg["target_lang"] != "Russian"):
         raise ValueError("books/skeleton currently support EN->RU; use OCR route or explicit advanced commands for other languages")
     return cfg
@@ -89,6 +169,13 @@ def initialize(source, out, settings=None):
         raise ValueError("input must exist; --out must be a NEW directory")
     route = detect(source)
     cfg = dict(DEFAULTS, source_lang="German" if route == "ocr" else "English")
+    if route == "ocr":
+        # OCR manifests bind the original aligned blocks. Older jobs stored the
+        # global default (900), which this route always ignored; load_job keeps
+        # those jobs resumable, while new jobs expose the effective setting.
+        cfg["group_chars"] = 0
+        if (settings or {}).get("group_chars", 0) != 0:
+            raise ValueError("OCR route requires group_chars=0 to preserve manifest block alignment")
     cfg.update(settings or {})
     cfg = validate_settings(cfg, route)
     books = []
@@ -108,6 +195,27 @@ def initialize(source, out, settings=None):
         pdfs = list(source.glob("*.pdf"))
         if len(pdfs) != 1:
             raise ValueError("skeleton needs exactly one source PDF in project root; prepare a separate input project")
+    policy_path = None
+    if cfg["keep_source"]:
+        if len(books) != 1:
+            raise ValueError("keep_source requires a single book, with its own unit indices")
+        from source_preservation import load_policy
+        policy_path = Path(cfg["keep_source"]).resolve()
+        load_policy(policy_path)
+    profiles = {}
+    for key, filename in (("glossary_profile", "request-glossary.profile.json"),
+                          ("book_profile", "book.profile.json")):
+        if cfg[key]:
+            path = Path(cfg[key]).resolve()
+            if key == "book_profile" and len(books) != 1:
+                raise ValueError("book_profile requires one book with exact content decisions")
+            if key == "glossary_profile":
+                from glossary_selection import load_profile
+                load_profile(path)
+            else:
+                from content_coverage import load_profile
+                load_profile(path)
+            profiles[key] = (path, filename)
     out.mkdir(parents=True)
     source_copy = out / "input"
     source_copy.mkdir()
@@ -118,7 +226,7 @@ def initialize(source, out, settings=None):
             dest = source_copy / key
             dest.mkdir()
             shutil.copy2(book, dest / book.name)
-            for asset in ("images", "glossary.md"):
+            for asset in ("images", "glossary.md", "glossary.profile.json"):
                 path = book.parent / asset
                 if path.is_dir():
                     copy_files(book.parent, dest, tree_files(path))
@@ -127,6 +235,12 @@ def initialize(source, out, settings=None):
             entries.append({"id": key, "source": f"input/{key}/{book.name}", "name": book.name})
     else:
         copy_files(source, source_copy, files)
+    if policy_path:
+        shutil.copy2(policy_path, source_copy / "keep-source.json")
+        cfg["keep_source"] = "input/keep-source.json"
+    for key, (path, filename) in profiles.items():
+        shutil.copy2(path, source_copy / filename)
+        cfg[key] = "input/" + filename
     inputs = {p.relative_to(out).as_posix(): sha_file(p) for p in tree_files(source_copy)}
     job = {"schema": 1, "route": route, "original": str(source), "settings": cfg,
            "books": entries, "inputs": inputs}
@@ -156,18 +270,29 @@ def command(script, *args):
 def code_identity():
     return canonical_hash({p.relative_to(ROOT).as_posix(): sha_file(p)
                            for folder in ("scripts", "skeleton", "assets") for p in (ROOT / folder).glob("*")
-                           if p.is_file() and p.suffix in (".py", ".tex", ".lua")})
+                           if p.is_file() and p.suffix in (".py", ".ps1", ".tex", ".lua")})
 
 
 def steps_for(root, job):
     cfg = job["settings"]
     common = ["--host", cfg["host"], "--model", cfg["model"], "--mode", cfg["mode"], "--parallel", str(cfg["parallel"])]
+    common += ["--split-chars", str(cfg["split_chars"]),
+               "--context-per-request", str(cfg["context_per_request"])]
+    def glossary_profile(folder):
+        path = inside(root, cfg["glossary_profile"]) if cfg.get("glossary_profile") else folder / "glossary.profile.json"
+        return ["--glossary-profile", path] if path.is_file() else []
     work = root / "work"
     if job["route"] == "books":
         return [(entry["id"], command("scripts/translate_book.py", inside(root, entry["source"]),
                  "--workdir", work / entry["id"], "--extract", cfg["extract"],
-                 "--mineru-timeout", cfg["mineru_timeout"], *common,
-                 "--author", cfg["author"],
+                  "--mineru-timeout", cfg["mineru_timeout"], *common,
+                  "--author", cfg["author"],
+                  "--group-chars", str(cfg["group_chars"]),
+                  "--layout", cfg["layout"],
+                 *glossary_profile(inside(root, entry["source"]).parent),
+                 *(["--book-profile", inside(root, cfg["book_profile"])] if cfg.get("book_profile") else []),
+                 *(["--keep-source", inside(root, cfg["keep_source"])] if cfg["keep_source"] else []),
+
                  *(["--title", cfg["title"]] if cfg["title"] else []),
                  *(["--glossary", inside(root, entry["source"]).parent / "glossary.md"]
                    if (inside(root, entry["source"]).parent / "glossary.md").is_file() else [])),
@@ -175,17 +300,17 @@ def steps_for(root, job):
     if job["route"] == "skeleton":
         main = "book/main.pdf" if (root / "input/book/main.tex").is_file() else "main.pdf"
         return [("skeleton", command("skeleton/translate_into_skeleton.py", work,
-                 "--extract", cfg["extract"], "--mineru-timeout", cfg["mineru_timeout"], *common), work / main)]
+                 "--extract", cfg["extract"], "--mineru-timeout", cfg["mineru_timeout"], *common,
+                 "--group-chars", cfg["group_chars"], *glossary_profile(root / "input")), work / main)]
     glossary = ["--glossary", work / "glossary.md"] if (root / "input/glossary.md").is_file() else []
-    gp = ["--glossary-profile", work / "glossary.profile.json"] if (root / "input/glossary.profile.json").is_file() else []
+    gp = glossary_profile(root / "input")
     extras = []
     for flag, name in (("--pagemap", "pagemap.json"), ("--figures", "figures.json")):
         if (root / "input" / name).is_file():
             extras += [flag, work / name]
     return [("prepare", command("scripts/build_ocr_md.py", work, "--parts", cfg["parts"], *extras), None),
             ("translate", command("scripts/run_doc_translate.py", work, *common, *glossary, *gp,
-                 "--source-lang", cfg["source_lang"], "--target-lang", cfg["target_lang"],
-                 "--split-chars", cfg["split_chars"], "--context-per-request", cfg["context_per_request"]), None),
+                 "--source-lang", cfg["source_lang"], "--target-lang", cfg["target_lang"]), None),
             ("build", command("scripts/assemble_ru_book.py", work, "--title", cfg["title"] or "Перевод",
                  "--author", cfg["author"], "--pdf", root / "result.pdf"), root / "result.pdf")]
 
@@ -239,7 +364,11 @@ def unchanged(root, hashes):
 
 
 def status(root):
-    state = read(root / STATE) if (root / STATE).is_file() else {"status": "not_initialized"}
+    try:
+        state = read_state(root) if (root / STATE).is_file() else {"status": "not_initialized"}
+    except StateFileError as exc:
+        return {"schema": 1, "status": "needs_attention", "next_action": "inspect_state",
+                "reason": str(exc), "state_error": exc.details}
     if state.get("status") == "running" and not alive(state.get("pid"), state.get("started")):
         state = dict(state, status="needs_attention" if alive(state.get("child_pid"), state.get("child_started")) else "interrupted",
                      next_action="inspect_live_child" if alive(state.get("child_pid"), state.get("child_started")) else "run")
@@ -256,7 +385,7 @@ def status(root):
 
 def run_job(root):
     job = load_job(root)
-    old = read(root / STATE)
+    old = read_state(root)
     holders = [(old.get("child_pid"), old.get("child_started"))]
     if old.get("status") == "running":
         holders.append((old.get("pid"), old.get("started")))
@@ -361,8 +490,17 @@ def main():
     init.add_argument("input")
     init.add_argument("--out", required=True)
     init.add_argument("--settings", help="JSON with explicit model/endpoint/options; defaults are local")
-    for action in ("run", "status", "plan"):
+    for action in ("run", "status", "plan", "background-status", "stop"):
         sub.add_parser(action).add_argument("job")
+    start = sub.add_parser("start", help="Windows: one-shot hidden task as current user")
+    start.add_argument("job")
+    start.add_argument("--start-lmstudio", action="store_true")
+    start.add_argument("--lmstudio-profile")
+    start.add_argument("--lmstudio-models")
+    start.add_argument("--lmstudio-backend")
+    start.add_argument("--lmstudio-app")
+    start.add_argument("--lms-exe")
+    start.add_argument("--startup-timeout", type=int, default=120)
     args = ap.parse_args()
     try:
         if args.action == "init":
@@ -370,6 +508,17 @@ def main():
             result = status(Path(args.out).resolve())
         else:
             root = Path(args.job).resolve()
+            if args.action in ("start", "background-status", "stop"):
+                import background_run
+                if args.action == "start":
+                    result = background_run.start(root, start_lmstudio=args.start_lmstudio,
+                        lmstudio_profile=args.lmstudio_profile, lmstudio_models=args.lmstudio_models,
+                        lmstudio_backend=args.lmstudio_backend,
+                        lms_exe=args.lms_exe, lmstudio_app=args.lmstudio_app, startup_timeout=args.startup_timeout)
+                else:
+                    result = (background_run.stop if args.action == "stop" else background_run.status)(root)
+                print(json.dumps(result, ensure_ascii=False))
+                return 0
             if args.action == "run":
                 rc = run_job(root)
                 print(json.dumps(status(root), ensure_ascii=False))
@@ -382,7 +531,7 @@ def main():
                 result = status(root)
         print(json.dumps(result, ensure_ascii=False))
         return 0
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
         print(json.dumps({"status": "needs_attention", "reason": str(exc), "next_action": "check_job"}, ensure_ascii=False))
         return 2
 

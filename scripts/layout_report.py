@@ -18,6 +18,7 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
+from tex_logs import read_tex_log
 
 # отчёт содержит экзотические глифы (список Missing characters) — не дать
 # консоли cp1251 уронить печать
@@ -99,7 +100,7 @@ def main():
         sys.exit(f"!! main.log/main.pdf not found in {build}")
 
     pages, overfulls, underfull, missing, by_font = scan_log(
-        log.read_text(encoding="utf-8", errors="replace"))
+        read_tex_log(log))
     if pages is None:
         try:
             pages = pdf_metrics(pdf)["pages"]
