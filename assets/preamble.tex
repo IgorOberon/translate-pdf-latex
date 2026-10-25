@@ -12,6 +12,20 @@
 % with the cm-unicode package. If it is not installed, swap for one of:
 %   Libertinus Serif  ·  PT Serif  ·  Noto Serif  ·  DejaVu Serif
 \setmainfont{CMU Serif}
+
+
+% The atlas marks cross-references with arrows and the point hierarchy with
+% geometric bullets; CMU Serif has no such glyphs, so XeTeX silently dropped
+% them. Map them to math symbols instead of losing them in the PDF.
+\usepackage{newunicodechar}
+\newunicodechar{➞}{\ensuremath{\rightarrow}}
+\newunicodechar{➔}{\ensuremath{\rightarrow}}
+\newunicodechar{➡}{\ensuremath{\Rightarrow}}
+\newunicodechar{●}{\ensuremath{\bullet}}
+\newunicodechar{■}{\ensuremath{\blacksquare}}
+\newunicodechar{≥}{\ensuremath{\geq}}
+\newunicodechar{≤}{\ensuremath{\leq}}
+\newunicodechar{≈}{\ensuremath{\approx}}
 \setsansfont{CMU Sans Serif}
 \setmonofont{CMU Typewriter Text}
 
@@ -38,10 +52,15 @@
 \renewcommand{\includegraphics}[2][]{%
   \IfFileExists{#2}{%
     \sbox\FigMeasureBox{\SavedIncludegraphics[#1]{#2}}%
-    \ifdim\wd\FigMeasureBox>\linewidth
-      \SavedIncludegraphics[width=\linewidth,keepaspectratio]{#2}%
+    \ifdim\hsize<\linewidth \edef\FigMaxWidth{\the\hsize}\else\edef\FigMaxWidth{\the\linewidth}\fi
+    % the extraction's crops carry a page-sized natural width; a 45% cap keeps
+    % the book compact (the printed figures are smaller) and the build in budget
+    \edef\FigMaxWidth{\dimexpr\FigMaxWidth*45/100\relax}
+    \ifdim\wd\FigMeasureBox>\FigMaxWidth
+      % a wide figure may still be too tall once scaled to the text width
+      \SavedIncludegraphics[width=\FigMaxWidth,height=0.82\textheight,keepaspectratio]{#2}%
     \else\ifdim\ht\FigMeasureBox>0.82\textheight
-      \SavedIncludegraphics[height=0.82\textheight,keepaspectratio]{#2}%
+      \SavedIncludegraphics[width=\linewidth,height=0.82\textheight,keepaspectratio]{#2}%
     \else\usebox\FigMeasureBox\fi\fi}%
   {\fbox{\parbox{0.7\linewidth}{\centering\small [рисунок не найден]\\ \ttfamily\tiny \detokenize{#2}}}}}
 % figure + caption glued together (emitted by assets/figcaption.lua):
@@ -58,17 +77,32 @@
 \usepackage{array}
 \usepackage{booktabs}
 \usepackage{longtable}          % pandoc emits long tables
+% Keep the table within its surrounding text block. Pandoc subtracts the
+% actual intercolumn spacing when it emits paragraph-column widths.
+\setlength{\LTleft}{0pt}
+\setlength{\LTright}{0pt}
+\AtBeginEnvironment{longtable}{\small\setlength{\tabcolsep}{4pt}}
 \usepackage{microtype}          % XeLaTeX: character protrusion (safe subset)
 % running heads: a long chapter title must never collide with the page
 % number — keep the book's look (italic marks) but truncate to 86% of the
 % text width. Chapter opening pages keep the plain style (number below).
 \usepackage{fancyhdr}
 \usepackage{truncate}
+% Three-digit chapter numbers ("140.22") overflow the default \numberline
+% box, so the title ran into the number. Widen the number fields.
+\makeatletter
+\renewcommand{\l@section}{\@dottedtocline{1}{1.5em}{4.2em}}
+\renewcommand{\l@subsection}{\@dottedtocline{2}{3.8em}{5.2em}}
+\makeatother
 \pagestyle{fancy}
 \fancyhf{}
 \renewcommand{\headrulewidth}{0pt}
 \fancyhead[L]{\itshape\truncate{0.86\textwidth}{\leftmark}}
 \fancyhead[R]{\itshape\thepage}
+% Layout profiles load geometry after this shared preamble. fancyhdr saved
+% the class's original width (345pt), so a compact 0.86\textwidth heading
+% overflowed it by exactly 95.20413pt on each output page.
+\AtBeginDocument{\setlength{\headwidth}{\textwidth}}
 \usepackage[hidelinks]{hyperref}
 
 % ---- pandoc compatibility (we feed pandoc-generated body fragments) ----------
@@ -91,4 +125,3 @@
 % которые извлечение классифицировало картинками)
 \newcommand{\plaquebegin}{\par\medskip\noindent\hrule\smallskip\begin{quote}\itshape}
 \newcommand{\plaqueend}{\end{quote}\smallskip\hrule\medskip\par}
-

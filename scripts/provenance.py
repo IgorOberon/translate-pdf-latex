@@ -148,10 +148,19 @@ def check_result(src, dst, manifest_hash=None):
         raise ValueError(f"missing request identity or aborted report: {dst.name}")
     if report.get("status") not in ("passed", "failed"):
         raise ValueError(f"invalid stage status: {dst.name}")
-    count = len(blocks(src.read_text(encoding="utf-8")))
-    if count != report.get("blocks_total") or count != len(blocks(dst.read_text(encoding="utf-8"))):
-        raise ValueError(f"block alignment mismatch: {dst.name}")
+    # The source identity is already proven by source_sha256 above. Counting the
+    # source's paragraphs is only valid when every paragraph is a request: with
+    # --group-chars several paragraphs form one block, so compare the report
+    # with the OUTPUT, which is where the alignment actually matters.
+    # A footnote definition is a block of its own in Markdown but not a
+    # translation unit, so it must not count towards the reported total.
+    def unit_blocks(text):
+        return [b for b in blocks(text)
+                if not re.match(r"^\[\^[^\]\s]+\]:", b)]
+
     current = report.get("output_sha256")
+    output_text = dst.read_bytes().decode("utf-8")
+    raw_output_text = output_text
     if not current:
         raise ValueError("report has no output identity")
     if sha_file(dst) != current:
@@ -164,9 +173,38 @@ def check_result(src, dst, manifest_hash=None):
             if (stage["parent_hash"] != current or sha_file(parent) != current
                     or sha_file(result) != stage["output_hash"] or not stage.get("edits")):
                 raise ValueError("broken post-edit lineage")
+            if current == report["output_sha256"]:
+                raw_output_text = parent.read_bytes().decode("utf-8")
             current = stage["output_hash"]
         if current != sha_file(dst):
             raise ValueError("translation has unrecorded edits")
+    from source_preservation import verify_preserved, remap_preserved
+    source_text = src.read_bytes().decode("utf-8")
+    verify_preserved(source_text, raw_output_text, report)
+    current_report = remap_preserved(raw_output_text, output_text, report)
+    verify_preserved(source_text, output_text, current_report)
+    protocol = report["request_config"].get("paragraph_protocol")
+    if protocol:
+        from paragraph_units import PROTOCOL, verify_coverage
+        from translate import split_blocks, group_blocks
+        if protocol != PROTOCOL:
+            raise ValueError("unknown paragraph coverage protocol")
+        source_blocks = split_blocks(source_text)
+        grouped = group_blocks(source_blocks, report["request_config"].get("group_chars", 0))
+        if len(grouped) != report.get("blocks_total"):
+            raise ValueError("paragraph group count mismatch")
+        verify_coverage(source_blocks, grouped, raw_output_text, report.get("paragraph_coverage"))
+        # Recorded prose edits may change spelling/length, but may not silently
+        # merge or delete paragraph boundaries from the accepted raw MT stage.
+        if len(blocks(output_text)) != len(blocks(raw_output_text)):
+            raise ValueError("post-edit paragraph alignment mismatch")
+        return report
+    # A deliberate preserved group keeps all paragraph/note boundaries. Its
+    # verified span is one MT unit, even when it contains multiple paragraphs.
+    for row in sorted(current_report.get("allowed_source", []), key=lambda r: r["output_start"], reverse=True):
+        output_text = output_text[:row["output_start"]] + "preserved unit" + output_text[row["output_end"]:]
+    if len(unit_blocks(output_text)) != report.get("blocks_total"):
+        raise ValueError(f"block alignment mismatch: {dst.name}")
     return report
 
 
@@ -187,19 +225,29 @@ def book_settings(args, glossary=None):
     keys = {"model": "hy-mt2-7b", "host": "http://localhost:1234", "mode": "hymt",
             "target_lang": "Russian", "extract": "auto", "no_clean": False,
             "layout": "screen", "heading_numbers": "auto", "author": "",
-            "polish": False, "polish_model": "qwen3.5:9b", "polish_host": "http://localhost:11434"}
+            "polish": False, "polish_model": "qwen3.5:9b", "polish_host": "http://localhost:11434",
+            "split_chars": 0, "group_chars": 0, "context_per_request": 0}
     value = {key: getattr(args, key, None) or default for key, default in keys.items()}
     value["glossary_sha256"] = sha_file(glossary) if glossary and Path(glossary).is_file() else None
+    for key in ("glossary_profile", "book_profile"):
+        path = getattr(args, key, None)
+        value[key + "_sha256"] = sha_file(path) if path else None
+    keep_source = getattr(args, "keep_source", None)
+    if keep_source:
+        value["source_preservation_sha256"] = sha_file(keep_source)
     return canonical_hash(value)
 
 
 def record_edit(src, dst, result, edits, config=None):
     """Append a derived stage, keeping raw report and before/after snapshots immutable."""
     dst = Path(dst)
-    check_result(src, dst)
+    report = check_result(src, dst)
     before = dst.read_bytes().decode("utf-8")
     if before == result:
         return
+    if (report["request_config"].get("paragraph_protocol")
+            and len(blocks(before)) != len(blocks(result))):
+        raise ValueError("post-edit paragraph alignment mismatch")
     lineage = Path(str(dst) + ".lineage.json")
     root_hash = sha_file(str(dst) + ".report.json")
     chain = {"schema": SCHEMA, "root_report_sha256": root_hash, "stages": []}
@@ -207,6 +255,13 @@ def record_edit(src, dst, result, edits, config=None):
         previous = json.loads(lineage.read_text(encoding="utf-8"))
         if previous.get("root_report_sha256") == root_hash:
             chain = previous
+    if report.get("allowed_source"):
+        from source_preservation import remap_preserved, verify_preserved
+        raw = (inside(dst.parent, chain["stages"][0]["parent_snapshot"]).read_bytes().decode("utf-8")
+               if chain["stages"] else before)
+        current_report = remap_preserved(raw, before, report)
+        proposed = remap_preserved(before, result, current_report)
+        verify_preserved(Path(src).read_bytes().decode("utf-8"), result, proposed)
     parent_hash, result_hash = sha_text(before), sha_text(result)
     snapshots = dst.parent / ".lineage" / dst.name
     for digest, text in ((parent_hash, before), (result_hash, result)):

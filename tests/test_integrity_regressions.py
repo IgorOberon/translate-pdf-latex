@@ -307,9 +307,11 @@ class TranslationIntegrity(unittest.TestCase):
             calls = []
             def runner(*args, **kwargs):
                 calls.append(1)
-                (root / "main.pdf").write_bytes(b"candidate")
-                pv.atomic_text(root / "main.log", "compiled")
-                pv.atomic_text(root / "main.aux", str(len(calls)))
+                build = Path(next(arg.split("=", 1)[1] for arg in args[0]
+                                  if arg.startswith("-output-directory=")))
+                (build / "main.pdf").write_bytes(b"candidate")
+                pv.atomic_text(build / "main.log", "compiled")
+                pv.atomic_text(build / "main.aux", str(len(calls)))
                 return SimpleNamespace(returncode=0)
             report = release.compile_latex(root / "main.tex", runner=runner, max_passes=3)
             self.assertEqual(len(calls), 3)

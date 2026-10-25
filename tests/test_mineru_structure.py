@@ -92,13 +92,62 @@ class Structure(unittest.TestCase):
         self.assertFalse(set(prep.NOTE.findall(a)) & set(prep.NOTE.findall(b)))
 
     def test_complex_or_broken_tables_fail(self):
-        for table in (TABLE.replace("<td>A", '<td colspan="2">A'),
-                      TABLE.replace("Mass (kg)", "<b>Mass</b>"),
-                      TABLE.replace("</table>", ""),
-                      TABLE.replace("<td>2</td>", ""),
-                      TABLE.replace("Mass (kg)", "Mass | unit")):
+        for table in (TABLE.replace("Mass (kg)", "<b>Mass</b>"),
+                      TABLE.replace("</table>", "")):
             with self.subTest(table=table), self.assertRaises(ValueError):
                 prep.normalize(table, [], "abc")
+
+    def test_merged_cells_are_expanded_without_losing_text(self):
+        table = TABLE.replace("<td>A", '<td colspan="2">A')
+        text, _ = prep.normalize(table, [], "abc")
+        grid = prep.pipe_tables(text)[0]
+        self.assertEqual(grid[0][0], "Quantity")
+        self.assertEqual(grid[0][1], "A")
+        self.assertEqual(grid[0][2], "")     # covered by the merge, not lost
+        self.assertEqual(grid[1], ["Mass (kg)", "2", ""])
+
+    def test_short_row_is_padded_not_dropped(self):
+        table = TABLE.replace("<td>2</td>", "")
+        text, _ = prep.normalize(table, [], "abc")
+        self.assertEqual(prep.pipe_tables(text)[0][1], ["Mass (kg)", ""])
+
+    def test_pipe_inside_cell_is_escaped(self):
+        table = TABLE.replace("Mass (kg)", "Mass | unit")
+        text, _ = prep.normalize(table, [], "abc")
+        self.assertIn(r"Mass \| unit", text)
+        self.assertEqual(prep.pipe_tables(text)[0][1][0], r"Mass \| unit")
+
+    def test_plain_mark_note_serves_every_mark_of_the_page(self):
+        raw = "Text with a note.\\* More text.\\*\n\nNext paragraph.\n"
+        items = [{"type": "text", "page_idx": 0,
+                  "text": "Text with a note.\\* More text.\\*"},
+                 {"type": "page_footnote", "page_idx": 0,
+                  "text": "\\* Mentioned by only some authors."}]
+        text, report = prep.normalize(raw, items, "abc")
+        self.assertEqual(len(report["footnotes"]), 1)
+        self.assertEqual(report["footnotes"][0]["references"], 2)
+        self.assertEqual(text.count("[^mu-abc-p1-n1]"), 3)   # two marks + definition
+        self.assertIn("[^mu-abc-p1-n1]: Mentioned by only some authors.", text)
+        self.assertEqual(report["unmatched_marks"], [])
+
+    def test_note_without_text_mark_is_kept_as_page_note(self):
+        raw = "A paragraph on the page.\n\nAnother paragraph.\n"
+        items = [{"type": "text", "page_idx": 0, "text": "A paragraph on the page."},
+                 {"type": "text", "page_idx": 0, "text": "Another paragraph."},
+                 {"type": "page_footnote", "page_idx": 0,
+                  "text": "\\* Mentioned by only some authors."}]
+        text, report = prep.normalize(raw, items, "abc")
+        self.assertEqual(len(report["page_notes"]), 1)
+        self.assertIn(r"> \* Mentioned by only some authors.", text)
+        self.assertNotIn("[^mu-", text)
+
+    def test_mark_without_note_is_reported(self):
+        raw = "Text with a mark.\\*\n\nNext paragraph.\n"
+        items = [{"type": "text", "page_idx": 0, "text": "Text with a mark.\\*"},
+                 {"type": "text", "page_idx": 0, "text": "Next paragraph."}]
+        text, report = prep.normalize(raw, items, "abc")
+        self.assertEqual(report["unmatched_marks"], [{"page_idx": 0, "label": "*"}])
+        self.assertIn(r"\*", text)
 
     def test_model_table_damage_is_rejected(self):
         src = prep.normalize(TABLE, [], "abc")[0]

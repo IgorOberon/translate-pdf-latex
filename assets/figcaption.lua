@@ -28,6 +28,61 @@ local function fig_block(src, cap_inlines)
     '\\FigWithCaption{%s}{%s}', src, latex_of_inlines(cap_inlines)))
 end
 
+-- Default-width pipe tables otherwise become natural-width l/r/c columns.
+-- Three page-sized images can then make the table wider than the page:
+-- those columns do not establish a cell-local linewidth for the image cap.
+function Table(tbl)
+  local missing = 0
+  for _, spec in ipairs(tbl.colspecs) do
+    if spec[2] == nil or spec[2] == 0 then missing = missing + 1 end
+  end
+  if missing == #tbl.colspecs and missing > 0 then
+    local specs = tbl.colspecs
+    for _, spec in ipairs(specs) do spec[2] = 1 / missing end
+    tbl.colspecs = specs
+  end
+  return tbl
+end
+
+local function is_gap(inline)
+  return inline.t == 'Space' or inline.t == 'SoftBreak' or inline.t == 'LineBreak'
+end
+
+-- A justified paragraph containing many differently sized image boxes can
+-- choose an overfull line to avoid extremely stretched spaces. Give image
+-- runs their own ragged paragraph; this also works inside a footnote or cell.
+-- Text before/after the run and each original Image node stay in order.
+local function split_image_runs(block)
+  if block.t ~= 'Para' and block.t ~= 'Plain' then return nil end
+  local out, text, i, changed = pandoc.Blocks({}), pandoc.List({}), 1, false
+  local function flush_text()
+    while #text > 0 and is_gap(text[#text]) do text:remove(#text) end
+    if #text > 0 then out:insert(block.t == 'Para' and pandoc.Para(text) or pandoc.Plain(text)) end
+    text = pandoc.List({})
+  end
+  while i <= #block.content do
+    if block.content[i].t == 'Image' then
+      local j, last, count = i, i, 0
+      while j <= #block.content do
+        if block.content[j].t == 'Image' then count = count + 1; last = j
+        elseif not is_gap(block.content[j]) then break end
+        j = j + 1
+      end
+      if count >= 2 then
+        flush_text()
+        local run = pandoc.List({})
+        for k = i, last do run:insert(block.content[k]) end
+        out:insert(pandoc.RawBlock('latex', '\\begingroup\\raggedright\n'
+          .. latex_of_inlines(run) .. '\n\\par\\endgroup'))
+        changed, i = true, last + 1
+        while i <= #block.content and is_gap(block.content[i]) do i = i + 1 end
+      else text:insert(block.content[i]); i = i + 1 end
+    else text:insert(block.content[i]); i = i + 1 end
+  end
+  flush_text()
+  return changed and out or nil
+end
+
 function Blocks(blocks)
   local out = pandoc.Blocks({})
   local i = 1
@@ -54,7 +109,8 @@ function Blocks(blocks)
       i = i + 2
     end
     if not handled then
-      out:insert(b)
+      local split = split_image_runs(b)
+      if split then out:extend(split) else out:insert(b) end
       i = i + 1
     end
   end

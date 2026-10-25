@@ -21,6 +21,7 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
+from tex_logs import read_tex_log
 from statistics import median
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -83,7 +84,7 @@ def main():
     L += [f"- WARNING «??»: {len(contexts)} контекст(ов)", ""]
 
     # ---------- m2: overfull ----------
-    log_text = (build / "main.log").read_text(encoding="utf-8", errors="replace")
+    log_text = read_tex_log(build / "main.log")
     pages_cnt, overfulls, underfull, missing, by_font = scan_log(log_text)
     top = sorted(overfulls, key=lambda o: -o["pt"])[:20]
     L += ["## m2. Overfull (полный лог)", "",

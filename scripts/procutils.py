@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from tex_logs import read_tex_log
 
 TIMEOUT_RC = 124            # конвенция GNU timeout: rc при зависании
 _LOCK_ENV = "FREETRANSLATE_LOCK"
@@ -201,8 +202,14 @@ def reap_mineru():
 def unload_llm(min_free_gb=8):
     """ОБЯЗАТЕЛЬНО перед извлечением: выгрузить резидентную LLM.
     lms unload --all; JIT вернёт модель при первом запросе перевода."""
+    owned_receipt = os.environ.get("FREETRANSLATE_MANAGED_LMSTUDIO_RECEIPT")
     lms = shutil.which("lms") or os.path.expanduser(r"~\.lmstudio\bin\lms.exe")
-    if Path(str(lms)).is_file():
+    if owned_receipt:
+        from lmstudio_runtime import unload_owned_models
+        receipt = json.loads(Path(owned_receipt).read_text(encoding="utf-8"))
+        unload_owned_models(receipt)
+        print(">> LLM выгружена через API собственного LM Studio", flush=True)
+    elif Path(str(lms)).is_file():
         r = subprocess.run([str(lms), "unload", "--all"],
                            capture_output=True, text=True, timeout=60)
         if r.returncode:
@@ -234,8 +241,7 @@ def unload_llm(min_free_gb=8):
 # --------------------------------------------------------------- run mineru
 def _log_tail(log_path, n=25):
     try:
-        lines = Path(log_path).read_text(encoding="utf-8",
-                                         errors="replace").splitlines()
+        lines = read_tex_log(log_path).splitlines()
         print("-- хвост лога mineru --\n" + "\n".join(lines[-n:]), flush=True)
     except OSError:
         pass

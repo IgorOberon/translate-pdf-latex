@@ -51,8 +51,11 @@ or `main.tex` + one source PDF. Markdown/text: pass the file explicitly.
 Unprepared Fraktur scans need specialized OCR setup below, not automatic MinerU.
 
 `run` is foreground and writes file logs + `pipeline.status.json` every 5 seconds
-during a stage. Use the host's supported background execution for a long job;
-don't invent an unattended daemon. `status` is read-only and makes no model calls.
+during a stage. On Windows use `pipeline.py start JOB` for a long job, then
+`background-status JOB`; `stop JOB` requests cancellation. The one-shot scheduled
+worker runs as the current user and survives the submitting console's closure.
+See [docs/BACKGROUND_RUN.md](docs/BACKGROUND_RUN.md) for LM Studio ownership,
+logs and session limits. `status` is read-only and makes no model calls.
 `done` means checked technical output, not scholarly or literary certification.
 Repeat `run` after resolving a reported issue; retained caches are revalidated.
 Do not relaunch if status is `running`, or if an orphan child is still alive.

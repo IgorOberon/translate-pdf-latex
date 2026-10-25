@@ -36,6 +36,10 @@ from procutils import (TIMEOUT_RC, PipelineLock, parse_unresolved,  # noqa: E402
 from provenance import check_result, sha_file, write_json, canonical_hash, inside, book_settings
 from build_release import compile_latex, inspect_pdf, publish_candidate, aux_state
 from prepare_mineru import prepare, assert_markdown_structure, assert_typeset_structure
+from source_preservation import translatable_output
+from tex_logs import read_tex_log
+from content_coverage import (clean_with_coverage, verify_cleaning_coverage,
+                              apply_book_edits, assert_no_control_chars, load_book_profile)
 
 print(">> translate_book.py v7 (clean, mask-repair, figcaption, layout, "
       "smart-build, audit) loaded", flush=True)
@@ -418,6 +422,10 @@ def main():
     ap.add_argument("--host", default="http://localhost:1234")
     ap.add_argument("--mode", choices=["hymt", "generic"], default="hymt")
     ap.add_argument("--glossary", default=None)
+    ap.add_argument("--glossary-profile", default=None)
+    ap.add_argument("--book-profile", default=None, help="exact reviewed cleaning/post-edit decisions")
+    ap.add_argument("--split-chars", type=int, default=0)
+    ap.add_argument("--context-per-request", type=int, default=0)
     ap.add_argument("--auto-glossary", action="store_true",
                     help="build glossary.md automatically from the extracted text "
                          "(recurring names/terms, translated once by the model)")
@@ -429,6 +437,10 @@ def main():
                     help="пауза после автогенерации глоссария: правите файл и жмёте Enter")
     ap.add_argument("--parallel", type=int, default=1,
                     help="одновременных запросов к серверу (под слоты LM Studio, напр. 3)")
+    ap.add_argument("--group-chars", type=int, default=0,
+                    help="объединять мелкие соседние абзацы в один запрос "
+                         "(0 = поабзацно). Для книг с тысячами коротких "
+                         "абзацев это снимает фиксированные накладные сервера")
     ap.add_argument("--pages-per-chunk", type=int, default=200,
                     help="PDF в режиме math крупнее этого — извлекать частями "
                          "(0 = отключить чанкинг)")
@@ -445,6 +457,7 @@ def main():
                     help=f"доля блоков, что можно оставить исходником и всё "
                          f"равно собрать PDF (по умолчанию {UNTRANSLATED_TOL:.0%}; "
                          "0 = строго, 1 = никогда не падать из-за перевода)")
+    ap.add_argument("--keep-source", help="explicit JSON decisions for unchanged masked/grouped units")
     ap.add_argument("--polish", action="store_true",
                     help="после перевода — литературная полировка "
                          "(mask -> translate --mode polish -> unmask)")
@@ -470,6 +483,17 @@ def main():
                          "LaTeX-номера разделов подавляются; latex: всегда "
                          "нумеровать по-LaTeX'овски")
     a = ap.parse_args()
+    if a.keep_source and a.polish:
+        ap.error("--keep-source cannot be combined with --polish; preserved units must remain unchanged")
+    if min(a.split_chars, a.group_chars, a.context_per_request) < 0:
+        ap.error("split/group/context settings must be nonnegative")
+    book_profile = load_book_profile(a.book_profile)
+    if a.no_clean and book_profile.get("cleaning", {}).get("decisions"):
+        ap.error("--no-clean cannot skip explicit cleaning decisions")
+    if a.keep_source and book_profile.get("post_edits"):
+        ap.error("post_edits cannot alter a --keep-source output; use a separate reviewed source revision")
+    from glossary_selection import load_profile
+    load_profile(a.glossary_profile)
 
     src = Path(a.book).resolve()
     if not src.exists():
@@ -486,6 +510,8 @@ def main():
         PipelineLock(note=f"translate_book:{root.name}").acquire()
 
     input_hash = sha_file(src)
+    preservation_hash = sha_file(a.keep_source) if a.keep_source else None
+    book_profile_hash = sha_file(a.book_profile) if a.book_profile else None
     extraction_config = canonical_hash({"source": input_hash, "mode": a.extract,
                                        "chunk": a.pages_per_chunk, "script": sha_file(__file__)})
     extraction_state = root / "extraction.state.json"
@@ -522,14 +548,18 @@ def main():
              "--json", wk / "plaques_candidates.json",
              "--report", wk / "plaques_report.md"])
 
-    # 1a) sanitize extracted markdown: OCR book-TOC, running heads, detached
-    # equation numbers (idempotent; cached — skipped when already up to date)
+    # Every cleaning decision is replayable against exact input bytes.
+    cleaning_source = md
+    coverage_path = wk / "cleaning.coverage.json"
     if not a.no_clean:
         clean_md = md.with_suffix(".clean.md")
-        if run([sys.executable, SCRIPTS / "clean_markdown.py", md, clean_md]).returncode:
-            die("markdown sanitation failed (use --no-clean to bypass)")
+        clean_with_coverage(md, clean_md, coverage_path, profile=book_profile)
         assert_markdown_structure(md.read_text(encoding="utf-8"), clean_md.read_text(encoding="utf-8"))
         md = clean_md
+    assert_no_control_chars(md.read_text(encoding="utf-8"))
+    coverage_hash = sha_file(coverage_path) if not a.no_clean else None
+    rebuild_toc = any(row.get("action") == "rebuild"
+                      for row in book_profile.get("cleaning", {}).get("decisions", []))
 
     structure_source = md.read_text(encoding="utf-8")
 
@@ -553,6 +583,7 @@ def main():
                 except EOFError:
                     pass
 
+    settings_hash = book_settings(a, gpath)
     # 2) mask
     masked, mapping = wk / "book.masked.md", wk / "book.map.json"
     if run([sys.executable, SCRIPTS / "mask_math.py", "mask",
@@ -563,17 +594,23 @@ def main():
     cmd = [masked, wk / "book.ru.masked.md",
            "--mode", a.mode, "--model", a.model, "--host", a.host,
            "--target-lang", a.target_lang, "--cache-dir", wk / ".tcache",
-           "--parallel", a.parallel]
+           "--parallel", a.parallel, "--group-chars", str(a.group_chars),
+           "--split-chars", str(a.split_chars), "--context-per-request", str(a.context_per_request)]
+    if a.glossary_profile:
+        cmd += ["--glossary-profile", a.glossary_profile]
     if gpath and gpath.exists():
         cmd += ["--glossary", gpath]
+    if a.keep_source:
+        cmd += ["--keep-source", a.keep_source]
     run_translate(cmd, wk / "book.ru.masked.md", what="translation",
                   tol=a.untranslated_tol)
 
     # 3a) приёмка: доля целевого алфавита; мало кириллицы = сервер падал и
     # блоки остались английскими («keeping source») — прогон не принимаем
     if a.target_lang.strip().lower() == "russian":
-        _t = re.sub(r"⟦M\d{6}⟧", "",
-                    (wk / "book.ru.masked.md").read_text(encoding="utf-8"))
+        _report = check_result(masked, wk / "book.ru.masked.md")
+        _t = re.sub(r"⟦M\d{6}⟧", "", translatable_output(
+                    (wk / "book.ru.masked.md").read_bytes().decode("utf-8"), _report))
         _c = len(re.findall(r"[А-Яа-яЁё]", _t))
         _l = len(re.findall(r"[A-Za-z]", _t))
         if _c + _l > 2000 and _c / (_c + _l) < 0.5:
@@ -583,6 +620,19 @@ def main():
     # 4) unmask (+гейт: unresolved строго 0)
     ru_md = wk / "book.ru.md"
     run_unmask(wk / "book.ru.masked.md", ru_md, mapping)
+
+    # Book-specific changes require exact, content-bound decisions. Keep the
+    # raw unmasked output as evidence and publish a distinct checked derivative.
+    unmasked = ru_md
+    _text = unmasked.read_bytes().decode("utf-8")
+    _fixed, post_report = apply_book_edits(_text, book_profile)
+    post_report_path = wk / "postprocess.coverage.json"
+    write_json(post_report_path, post_report)
+    if _fixed != _text:
+        ru_md = wk / "book.ru.reviewed.md"
+        ru_md.write_text(_fixed, encoding="utf-8", newline="")
+    post_report_hash = sha_file(post_report_path)
+    unmasked_hash = sha_file(unmasked)
 
     # 4b) полировка (опционально): литературная правка переведённого текста
     # по замаскированному файлу — формулы не уходят в полировщик; канон
@@ -598,13 +648,18 @@ def main():
         pcmd = [p_masked, p_out,
                 "--mode", "polish", "--model", a.polish_model,
                 "--host", a.polish_host, "--target-lang", a.target_lang,
-                "--cache-dir", wk / ".tcache_polish", "--parallel", a.parallel]
+                "--cache-dir", wk / ".tcache_polish", "--parallel", a.parallel,
+                "--split-chars", a.split_chars, "--group-chars", a.group_chars,
+                "--context-per-request", a.context_per_request]
+        if a.glossary_profile:
+            pcmd += ["--glossary-profile", a.glossary_profile]
         if gpath and gpath.exists():
             pcmd += ["--glossary", gpath]
         run_translate(pcmd, p_out, what="polish", tol=a.untranslated_tol)
         run_unmask(p_out, polished, p_map, what="polish")
         ru_md = polished
 
+    assert_no_control_chars(ru_md.read_text(encoding="utf-8"))
     assert_markdown_structure(structure_source, ru_md.read_text(encoding="utf-8"))
     assembly_hash = canonical_hash({"md": sha_file(ru_md), "source": sha_file(src),
                                    "translation": sha_file(wk / "book.ru.masked.md")})
@@ -652,7 +707,7 @@ def main():
     if not ok:
         log = bl / "main.log"
         if log.exists():
-            tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
+            tail = read_tex_log(log).splitlines()[-30:]
             print("\n".join(tail))
         die(f"LaTeX failed — inspect {log}. Typical fix: escape a special "
             "character in build/body.tex, then re-run (translation is cached).")
@@ -670,22 +725,43 @@ def main():
     except ImportError:
         print("?? PyMuPDF не установлен — самоаудит пропущен "
               "(pip install pymupdf)")
+    if rebuild_toc and r"\tableofcontents" not in (bl / "main.tex").read_text(encoding="utf-8"):
+        die("TOC rebuild decision requires a generated table of contents")
     technical = inspect_pdf(bl / "main.pdf", bl / "main.log",
-                            require_toc=bool(re.search(r"(?m)^#", ru_md.read_text(encoding="utf-8"))),
+                            require_toc=rebuild_toc or bool(re.search(r"(?m)^#", ru_md.read_text(encoding="utf-8"))),
                             source_text=md.read_text(encoding="utf-8"))
     raw = check_result(masked, wk / "book.ru.masked.md")
+    if book_settings(a, gpath) != settings_hash:
+        die("translation settings/profile changed during build; candidate not published")
+    if (sha_file(a.book_profile) if a.book_profile else None) != book_profile_hash:
+        die("book profile changed during build; candidate not published")
+    if not a.no_clean:
+        verify_cleaning_coverage(cleaning_source, md, coverage_path, profile=book_profile)
+        if sha_file(coverage_path) != coverage_hash:
+            die("cleaning receipt changed during build")
+    if sha_file(post_report_path) != post_report_hash or sha_file(unmasked) != unmasked_hash:
+        die("postprocessing evidence changed during build")
+    if ((sha_file(a.keep_source) if a.keep_source else None) != preservation_hash
+            or raw.get("source_preservation_sha256") != preservation_hash):
+        die("keep-source policy changed during build; published PDF unchanged")
     if (sha_file(src) != input_hash or assembly_hash != canonical_hash({"md": sha_file(ru_md),
             "source": sha_file(src), "translation": sha_file(wk / "book.ru.masked.md")})):
         die("assembly inputs changed during build; published PDF unchanged")
-    partial = raw["status"] != "passed"
+    partial = raw["status"] != "passed" or bool(raw.get("kept_source")) or bool(raw.get("failed_blocks"))
     if a.polish:
         partial |= check_result(p_masked, p_out)["status"] != "passed"
     release = {"schema": 1, "profile": "draft" if partial else "release",
                "status": "failed" if technical["status"] != "passed" or missing else "warning" if partial else "passed",
                "source_sha256": sha_file(src), "pdf_sha256": sha_file(bl / "main.pdf"),
-               "settings_sha256": book_settings(a, gpath),
+               "settings_sha256": settings_hash,
                "compile": json.loads((bl / "compile.report.json").read_text(encoding="utf-8")),
                "technical": technical, "translation_report_sha256": sha_file(str(wk / "book.ru.masked.md") + ".report.json"),
+               "preserved_source": raw.get("preserved_source", 0),
+               "allowed_source": raw.get("allowed_source", []),
+               "source_preservation_sha256": preservation_hash,
+               "book_profile_sha256": book_profile_hash,
+               "cleaning_coverage_sha256": coverage_hash,
+               "postprocess_coverage_sha256": post_report_hash,
                "visual_review": "not_run", "semantic_review": "not_run"}
     write_json(bl / "release.report.json", release)
     if release["status"] != "passed":

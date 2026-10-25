@@ -16,9 +16,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from provenance import atomic_text, write_json, sha_file, blocks
+from provenance import atomic_text, write_json, sha_file, sha_text, blocks
 from build_release import compile_latex, inspect_pdf
 from translate import validate_candidate
+from paragraph_units import MARKER, parse_response, encode
+
+
+def mock_translate_body(source):
+    """Deterministic fixture translation; framing remains a real translator gate."""
+    if source.startswith("#"):
+        number = re.match(r"#+\s+(\d+(?:\.\d+)*)\s", source)
+        return re.match(r"#+", source)[0] + " " + (number[1] + " " if number else "") + "Основные определения"
+    target = "Проверенный тестовый перевод сохраняет определения и формулы. "
+    target += " ".join(re.findall(r"⟦M\d{6}⟧", source))
+    return target.strip()
+
+
+def mock_translate_request(source):
+    if source.startswith("Translate the following segment"):
+        source = source.split("\n\n", 1)[1]
+    if MARKER.search(source):
+        parts = [{"fragment_id": m[2]} for m in MARKER.finditer(source) if not m[1]]
+        return encode(parts, [mock_translate_body(body) for body in parse_response(source, parts)])
+    return mock_translate_body(source)
 
 
 class MockMT(BaseHTTPRequestHandler):
@@ -28,14 +48,7 @@ class MockMT(BaseHTTPRequestHandler):
     def do_POST(self):
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         source = payload["messages"][-1]["content"]
-        if source.startswith("Translate the following segment"):
-            source = source.split("\n\n", 1)[1]
-        if source.startswith("#"):
-            number = re.match(r"#+\s+(\d+(?:\.\d+)*)\s", source)
-            target = re.match(r"#+", source)[0] + " " + (number[1] + " " if number else "") + "Основные определения"
-        else:
-            target = "Проверенный тестовый перевод сохраняет определения и формулы. "
-            target += " ".join(re.findall(r"⟦M\d{6}⟧", source))
+        target = mock_translate_request(source)
         self.reply({"choices": [{"message": {"content": target.strip()}, "finish_reason": "stop"}]})
 
     def reply(self, value):
@@ -95,8 +108,36 @@ def main():
         en.mkdir()
         atomic_text(en / "source.md", "# Mechanics\n\nThe equation $F=ma$ defines the force.\n\nThe energy is $$E=mc^2.$$\n")
         run("en-pipeline", "scripts/translate_book.py", en / "source.md", "--host", host,
-            "--model", "mock", "--workdir", en / "work", "--no-lock", "--no-plaques")
-        results["EN_math"] = {"status": "passed", "pdf": "en/work/source.ru.pdf"}
+            "--model", "mock", "--workdir", en / "work", "--no-lock", "--no-plaques",
+            "--group-chars", "900", "--split-chars", "900")
+        mt_report = json.loads((en / "work/work/book.ru.masked.md.report.json").read_text(encoding="utf-8"))
+        assert len(mt_report["paragraph_coverage"]) == 3, mt_report
+        assert mt_report["blocks_total"] == 1 and mt_report["kept_source"] == 0, mt_report
+        assert Path(mt_report["attempt_journal"]).is_dir(), mt_report
+        results["EN_math"] = {"status": "passed", "pdf": "en/work/source.ru.pdf",
+                              "source_paragraphs": 3, "covered_paragraphs": 3,
+                              "grouped_requests": True, "attempt_journal": "retained"}
+
+        # A long original bibliography is explicitly retained; its Latin text
+        # must not trip the target-script heuristic or silently relax failures.
+        retained = out / "preserved"
+        retained.mkdir()
+        bibliography = "Author reference and original bibliographic spelling. " * 50
+        bibliography = bibliography.strip()
+        atomic_text(retained / "source.md", "# References\n\n" + bibliography)
+        write_json(retained / "keep.json", {"schema": 1, "blocks": [{"index": 2,
+            "source_sha256": sha_text(bibliography), "reason": "Bibliography retained in its original spelling"}]})
+        original = sha_file(retained / "source.md")
+        run("preserved-pipeline", "scripts/translate_book.py", retained / "source.md", "--host", host,
+            "--model", "mock", "--workdir", retained / "work", "--no-lock", "--no-plaques", "--no-clean",
+            "--layout", "compact", "--keep-source", retained / "keep.json")
+        receipt = json.loads((retained / "work/source.ru.pdf.release.json").read_text(encoding="utf-8"))
+        assert receipt["profile"] == "release" and receipt["status"] == "passed", receipt
+        assert receipt["preserved_source"] == 1 and len(receipt["allowed_source"]) == 1
+        assert sha_file(retained / "source.md") == original
+        assert bibliography in (retained / "work/work/book.ru.masked.md").read_text(encoding="utf-8")
+        results["explicit_source_preservation"] = {"status": "passed", "profile": "release",
+            "preserved_source": 1, "pdf": "preserved/work/source.ru.pdf"}
 
         # Multiscript: technical validator + real fonts/PDF, including lawful CJK.
         mixed = out / "mixed"

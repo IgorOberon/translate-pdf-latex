@@ -30,6 +30,7 @@ from provenance import MANIFEST, create_manifest, load_manifest, inside, check_r
 from request_plan import plan_fragments
 from glossary_selection import load_profile, select_glossary
 from translate import build_messages, split_blocks, is_translatable
+from request_budget import estimate_messages
 from editorial import source_review, term_guard_findings, review_ledger
 
 PY = venv_python()
@@ -95,7 +96,7 @@ def check_context(work_dir, glossary_path, model, parallel, split_chars,
                                           select_glossary(text, glossary, glossary_profile),
                                           source_lang=source_lang)
                 # 2 chars/token plus a 20% margin and full configured reply reserve.
-                estimate = int(sum(len(m["content"]) for m in messages) / 2 * 1.2) + 4096 + 64
+                estimate = estimate_messages(messages)
                 need = max(need, estimate)
     lines = [f"estimated maximum request+reply budget: ~{need} tokens; fragment {longest} chars"]
     if not context_per_request:
@@ -177,6 +178,7 @@ def main():
                "--target-lang", a.target_lang, "--source-lang", a.source_lang,
                "--cache-dir", cache, "--parallel", str(a.parallel),
                "--split-chars", str(a.split_chars), "--min-ratio", str(a.min_ratio),
+               "--context-per-request", str(0 if a.skip_context_check else a.context_per_request),
                "--manifest-sha256", manifest["manifest_sha256"]]
         if a.glossary:
             cmd += ["--glossary", a.glossary]

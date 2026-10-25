@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from tex_logs import read_tex_log
 
 print(">> measure_build.py v1", flush=True)
 
@@ -122,7 +123,7 @@ def main():
 
     log = build / "main.log"
     if log.exists():
-        metrics.update(log_metrics(log.read_text(encoding="utf-8", errors="replace")))
+        metrics.update(log_metrics(read_tex_log(log)))
     toc = build / "main.toc"
     if toc.exists():
         metrics["toc_trailing_digits"] = toc_trailing_digits(

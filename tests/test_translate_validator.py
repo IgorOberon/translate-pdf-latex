@@ -302,6 +302,25 @@ def scenario_cjk_leak_still_rejected():
     ], r
 
 
+def test_group_blocks_keeps_tables_and_images_alone():
+    """Grouping may only join short paragraphs; tables and pictures stay whole."""
+    from translate import group_blocks, split_blocks
+    text = ("First paragraph.\n\nSecond paragraph.\n\n"
+            "| a | b |\n| --- | --- |\n| 1 | 2 |\n\n"
+            "![](images/x.jpg)\n\nThird paragraph.")
+    blocks = split_blocks(text)
+    assert group_blocks(blocks, 0) == blocks          # off by default
+    grouped = group_blocks(blocks, 40)
+    assert "\n\n".join(grouped) == text.strip()        # no text lost or reordered
+    assert any(g.startswith("First paragraph.") and "Second paragraph." in g for g in grouped)
+    assert any("| a | b |" in g for g in grouped)
+    assert any("![](images/x.jpg)" in g for g in grouped)
+    # a table block is never merged with a paragraph
+    for g in grouped:
+        if g.lstrip().startswith("|"):
+            assert g.count("\n\n") == 0
+
+
 def main():
     failed = total = 0
     for scenario in (scenario_validator, scenario_polish,

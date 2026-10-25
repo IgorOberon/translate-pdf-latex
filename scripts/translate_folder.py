@@ -84,6 +84,10 @@ def main():
                     help="строить глоссарий автоматически для каждой книги")
     ap.add_argument("--target-lang", default="Russian")
     ap.add_argument("--parallel", type=int, default=1)
+    ap.add_argument("--split-chars", type=int, default=0)
+    ap.add_argument("--group-chars", type=int, default=0)
+    ap.add_argument("--context-per-request", type=int, default=0)
+    ap.add_argument("--glossary-profile", default=None)
     ap.add_argument("--pages-per-chunk", type=int, default=200)
     ap.add_argument("--vram-limit", type=int, default=0)
     ap.add_argument("--force", action="store_true",
@@ -150,7 +154,11 @@ def main():
         cmd = [sys.executable, BOOK_SCRIPT, src, "--workdir", wd,
                "--extract", a.extract, "--model", a.model, "--host", a.host,
                "--mode", a.mode, "--target-lang", a.target_lang,
-               "--parallel", a.parallel, "--pages-per-chunk", a.pages_per_chunk]
+               "--parallel", a.parallel, "--pages-per-chunk", a.pages_per_chunk,
+               "--split-chars", a.split_chars, "--group-chars", a.group_chars,
+               "--context-per-request", a.context_per_request]
+        if a.glossary_profile:
+            cmd += ["--glossary-profile", a.glossary_profile]
         if a.vram_limit:
             cmd += ["--vram-limit", a.vram_limit]
         if a.glossary:
