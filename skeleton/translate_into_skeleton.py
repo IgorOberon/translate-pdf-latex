@@ -404,29 +404,48 @@ def run_translate(cmd, dst):
 
 def translate_chapter(work, md, a):
     """clean -> mask -> translate -> unmask; возвращает путь к ru.md."""
+    from content_coverage import verify_cleaning_coverage, assert_no_control_chars
     ru = work / "chapter.ru.md"
     state_path = work / "chapter.state.json"
-    config_hash = canonical_hash({"mode": a.mode, "model": a.model, "host": a.host,
-        "glossary": sha_file(a.glossary) if a.glossary else None,
-        "translator": sha_file(SCRIPTS / "translate.py"), "masker": sha_file(SCRIPTS / "mask_math.py"),
-        "cleaner": sha_file(SCRIPTS / "clean_markdown.py")})
+    def current_config():
+        return canonical_hash({"mode": a.mode, "model": a.model, "host": a.host,
+            "glossary": sha_file(a.glossary) if a.glossary else None,
+            "glossary_profile": sha_file(a.glossary_profile) if getattr(a, "glossary_profile", None) else None,
+            "split_chars": getattr(a, "split_chars", 0), "group_chars": getattr(a, "group_chars", 0),
+            "context_per_request": getattr(a, "context_per_request", 0),
+            "code": {name: sha_file(SCRIPTS / name) for name in (
+                "translate.py", "mask_math.py", "clean_markdown.py", "content_coverage.py",
+                "paragraph_units.py", "request_plan.py", "request_budget.py", "glossary_selection.py")}})
+    config_hash = current_config()
     if ru.is_file() and state_path.is_file() and not a.force:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if (state.get("source_sha256") == sha_file(md)
                 and state.get("output_sha256") == sha_file(ru)
                 and state.get("config_sha256") == config_hash):
             check_result(work / "chapter.masked.md", work / "chapter.ru.masked.md")
+            verify_cleaning_coverage(md, work / "chapter.clean.md")
+            if state.get("coverage_sha256") != sha_file(work / "chapter.clean.coverage.json"):
+                die("chapter cleaning receipt changed; existing output retained")
+            assert_no_control_chars(ru.read_text(encoding="utf-8"))
+            if current_config() != config_hash:
+                die("chapter translation settings/profile changed; existing output retained")
             return ru
     clean = work / "chapter.clean.md"
     masked = work / "chapter.masked.md"
     rumasked = work / "chapter.ru.masked.md"
     mp = work / "chapter.map.json"
     stage_script("clean_markdown.py", md, clean)
+    verify_cleaning_coverage(md, clean)
     assert_markdown_structure(md.read_text(encoding="utf-8"), clean.read_text(encoding="utf-8"))
     stage_script("mask_math.py", "mask", clean, masked, mp)
     cmd = [masked, rumasked, "--mode", a.mode,
            "--model", a.model, "--host", a.host,
-           "--parallel", str(a.parallel), "--cache-dir", work / ".tcache"]
+           "--parallel", str(a.parallel), "--cache-dir", work / ".tcache",
+           "--split-chars", str(getattr(a, "split_chars", 0)),
+           "--group-chars", str(getattr(a, "group_chars", 0)),
+           "--context-per-request", str(getattr(a, "context_per_request", 0))]
+    if getattr(a, "glossary_profile", None):
+        cmd += ["--glossary-profile", a.glossary_profile]
     if a.glossary:
         cmd += ["--glossary", a.glossary]
     run_translate(cmd, rumasked)
@@ -448,8 +467,13 @@ def translate_chapter(work, md, a):
     if report["status"] != "passed":
         die("chapter is partial: candidate retained; skeleton not updated")
     assert_markdown_structure(clean.read_text(encoding="utf-8"), ru.read_text(encoding="utf-8"))
+    verify_cleaning_coverage(md, clean)
+    assert_no_control_chars(ru.read_text(encoding="utf-8"))
+    if current_config() != config_hash:
+        die("chapter translation settings/profile changed; skeleton not updated")
     write_json(state_path, {"source_sha256": sha_file(md), "output_sha256": sha_file(ru),
-                            "config_sha256": config_hash})
+                            "config_sha256": config_hash,
+                            "coverage_sha256": sha_file(clean.with_suffix(".coverage.json"))})
     return ru
 
 
@@ -621,6 +645,10 @@ def main():
     ap.add_argument("--glossary", default=None,
                     help="фид en => ru (по умолчанию <project>/glossary.md, если есть)")
     ap.add_argument("--parallel", type=int, default=1)
+    ap.add_argument("--split-chars", type=int, default=0)
+    ap.add_argument("--group-chars", type=int, default=0)
+    ap.add_argument("--context-per-request", type=int, default=0)
+    ap.add_argument("--glossary-profile", default=None)
     ap.add_argument("--vram-limit", type=int, default=0)
     ap.add_argument("--engine", choices=["auto", "lualatex", "xelatex"],
                     default="auto")
