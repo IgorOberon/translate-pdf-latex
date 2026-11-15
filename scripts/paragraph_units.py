@@ -73,6 +73,10 @@ def parse_response(text, parts):
     """Strict framing: exact count/order/IDs, nonempty bodies, no outside text."""
     if not isinstance(text, str):
         raise ValueError("paragraph reply is not text")
+    # Only normalize horizontal whitespace on an otherwise exact marker line.
+    # No IDs, body text, count, order, newlines or outside text are repaired.
+    text = "\n".join(line.strip(" \t\r") if MARKER.fullmatch(line.strip(" \t\r"))
+                     else line for line in text.split("\n"))
     tokens = list(MARKER.finditer(text))
     expected = [(slash, p["fragment_id"]) for p in parts for slash in ("", "/")]
     if [(m[1], m[2]) for m in tokens] != expected:
