@@ -97,6 +97,32 @@ class PackagingTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     package.package_files(root)
 
+    def test_public_collection_does_not_bundle_historical_engines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            accepted = [
+                "companion-skills/local-mt-batch/SKILL.md",
+                "companion-skills/translation-pipeline-diagnostics/agents/openai.yaml",
+            ]
+            historical = [
+                "companion-skills/local-mt-batch/scripts/translate.py",
+                "companion-skills/translate-book-to-latex/SKILL.md",
+                "companion-skills/collection.manifest.json",
+            ]
+            for name in accepted + historical:
+                atomic_text(root / name, "fixture")
+            tracked = ["scripts/translate.py", *accepted, *historical]
+            result = SimpleNamespace(returncode=0, stdout=("\0".join(tracked) + "\0").encode())
+            with patch.object(package, "DOCS", ["SKILL.md"]), patch.object(package.subprocess, "run", return_value=result):
+                for profile in ("user", "full"):
+                    files = package.package_files(root, profile)
+                    self.assertEqual(set(files), {"SKILL.md", "scripts/translate.py", *accepted})
+                    write_json(root / "package.manifest.json", {"profile": profile,
+                               "files": {name: sha_file(root / name) for name in files}})
+                    with patch.object(package.subprocess, "run", side_effect=OSError):
+                        self.assertEqual(package.package_files(root), files)
+
     def test_non_git_uses_inventory_not_recursion(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

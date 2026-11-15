@@ -104,6 +104,7 @@ class RouteRequestSettingsTests(unittest.TestCase):
                     "--no-lock", "--no-clean", "--split-chars", "725", "--group-chars", "1400",
                     "--context-per-request", "8192", "--glossary-profile", str(gp)]
             with patch.object(sys, "argv", argv), patch.object(book, "preflight"), \
+                    patch.object(book, "repair_masked_display_prose"), \
                     patch.object(book, "run", return_value=SimpleNamespace(returncode=0)), \
                     patch.object(book, "run_translate", side_effect=CapturedCall) as called:
                 with self.assertRaises(CapturedCall):
@@ -290,9 +291,9 @@ class RouteRequestSettingsTests(unittest.TestCase):
                     patch.object(mt.time, "sleep"), patch.object(sys, "stderr", io.StringIO()):
                 with self.assertRaises(SystemExit) as failed:
                     mt.main()
-            self.assertEqual(failed.exception.code, 4)
+            self.assertEqual(failed.exception.code, 3)
             api.assert_not_called()
-            self.assertEqual(output.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+            self.assertFalse(output.exists())  # fail-fast cannot publish a source-only candidate
             self.assertFalse(list((root / "cache").glob("*.json")))
             report = json.loads(Path(str(output) + ".report.json").read_text(encoding="utf-8"))
             self.assertEqual(report["status"], "failed")
@@ -309,7 +310,7 @@ class RouteRequestSettingsTests(unittest.TestCase):
                 gp = write(root / "profile.json", json.dumps({"schema": 1, "critical": entries}))
                 output = root / "target.md"
 
-                def response(host, model, messages, temperature, top_p):
+                def response(host, model, messages, temperature, top_p, **kwargs):
                     tokens = list(mt.paragraphs.MARKER.finditer(messages[-1]["content"]))
                     if not tokens:
                         return leaked

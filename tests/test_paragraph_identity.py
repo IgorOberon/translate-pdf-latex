@@ -32,7 +32,7 @@ class ParagraphIdentity(unittest.TestCase):
         args = ["translate", str(src), str(dst), "--cache-dir", str(root / "cache"),
                 "--group-chars", "900", *extra]
 
-        def answer(host, model, messages, temperature, top_p):
+        def answer(host, model, messages, temperature, top_p, **kwargs):
             request = reply_text(messages)
             return response(request) if response else request.replace("First", "Первый").replace(
                 "Second", "Второй").replace("paragraph", "абзац").replace("sentence", "предложение")
@@ -80,13 +80,15 @@ class ParagraphIdentity(unittest.TestCase):
         source = "First paragraph.\n\nSecond paragraph."
 
         def dropped(request):
+            if not pu.MARKER.search(request):
+                return ""  # The bounded per-paragraph recovery also fails.
             end = next(m.end() for m in pu.MARKER.finditer(request) if m[1] == "/")
             return request[:end].replace("First", "Первый")
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             src, dst, report, rc, api = self.translate(root, source, dropped)
-            self.assertEqual((rc, api.call_count, report["kept_source"]), (4, 3, 1))
+            self.assertEqual((rc, api.call_count, report["kept_source"]), (4, 4, 1))
             self.assertEqual(dst.read_text(encoding="utf-8"), source)
             self.assertFalse(list((root / "cache").glob("*.json")))
             self.assertEqual(check_result(src, dst), report)
