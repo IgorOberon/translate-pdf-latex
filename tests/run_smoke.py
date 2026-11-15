@@ -36,7 +36,8 @@ SUITES = [
     "test_source_preservation.py",
 ]
 
-PYTEST_SUITES = ["test_build_resume.py", "test_longtable_layout.py", "test_atlas_translation.py",
+PYTEST_SUITES = ["test_pipeline_diagnostics.py", "test_incremental_mt.py", "test_stage_checkpoints.py",
+                 "test_build_resume.py", "test_longtable_layout.py", "test_atlas_translation.py",
                  "test_attempt_journal.py", "test_paragraph_identity.py",
                  "test_content_coverage.py", "test_route_request_settings.py",
                  "test_translation_attempt_journal.py", "test_book_coverage_integration.py",

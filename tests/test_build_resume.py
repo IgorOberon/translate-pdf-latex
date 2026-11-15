@@ -119,7 +119,8 @@ def test_resume_rejects_modified_input_and_completed_or_foreign_pdf(tmp_path):
     completed_report = (clean_output / "compile.report.json").read_bytes()
     completed_pdf = sha_file(clean_output / "main.pdf")
     count = len(calls)
-    assert compile_latex(main, clean_output, runner=successful)["status"] == "failed"
+    reused = compile_latex(main, clean_output, runner=successful)
+    assert reused["status"] == "passed" and reused["reused"]
     assert len(calls) == count
     assert sha_file(clean_output / "main.pdf") == completed_pdf
     assert (clean_output / "compile.report.json").read_bytes() == completed_report

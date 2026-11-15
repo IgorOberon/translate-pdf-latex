@@ -175,7 +175,7 @@ class TranslationIntegrity(unittest.TestCase):
             self.assertTrue(all(source[p["start"]:p["end"]] == p["text"] for p in parts))
 
     def test_T09_oversized_is_not_hidden_from_budget(self):
-        source = "A very long indivisible sentence " * 60
+        source = "indivisible" * 180  # no sentence OR protected whitespace boundary
         plan = plan_fragments(source, 100)
         self.assertEqual(len(plan), 1)
         self.assertTrue(plan[0]["oversized"])

@@ -42,10 +42,14 @@ def mock_translate_request(source):
 
 
 class MockMT(BaseHTTPRequestHandler):
+    requests = 0
+
     def do_GET(self):
+        MockMT.requests += 1
         self.reply({"data": [{"id": "mock"}]})
 
     def do_POST(self):
+        MockMT.requests += 1
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         source = payload["messages"][-1]["content"]
         target = mock_translate_request(source)
@@ -117,6 +121,22 @@ def main():
         results["EN_math"] = {"status": "passed", "pdf": "en/work/source.ru.pdf",
                               "source_paragraphs": 3, "covered_paragraphs": 3,
                               "grouped_requests": True, "attempt_journal": "retained"}
+        # Real entrypoint resume: no model request, no new candidate/TeX pass,
+        # immutable accepted PDF, and all release validators still run.
+        before_requests = MockMT.requests
+        builds = sorted((en / "work/build").glob("candidate-*"))
+        compile_before = {str(p): sha_file(p) for b in builds for p in b.glob("pass-*.log")}
+        pdf_before = sha_file(en / "work/source.ru.pdf")
+        run("en-resume", "scripts/translate_book.py", en / "source.md", "--host", host,
+            "--model", "mock", "--workdir", en / "work", "--no-lock", "--no-plaques",
+            "--group-chars", "900", "--split-chars", "900")
+        assert MockMT.requests == before_requests, "unchanged resume called model API"
+        assert sorted((en / "work/build").glob("candidate-*")) == builds
+        assert {str(p): sha_file(p) for b in builds for p in b.glob("pass-*.log")} == compile_before
+        assert sha_file(en / "work/source.ru.pdf") == pdf_before
+        results["EN_resume"] = {"status": "passed", "model_requests": 0,
+                                "new_build_candidates": 0, "new_tex_passes": 0,
+                                "pdf_unchanged": True}
 
         # A long original bibliography is explicitly retained; its Latin text
         # must not trip the target-script heuristic or silently relax failures.

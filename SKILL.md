@@ -20,23 +20,21 @@ An OpenCode or other agent need only run fixed commands and read compact status.
 Run from this skill's directory with its Python environment (Windows:
 `venv\Scripts\python.exe`; otherwise the installed Python with requirements).
 Dependencies and the model must already be installed; see `УСТАНОВКА.md` if absent.
-Translation-engine languages are configurable; the simple books/skeleton routes
-currently accept EN->RU only, and the prepared OCR workflow is verified for DE->RU.
-Do not promise arbitrary-language PDF production from MT language flags alone:
-OCR, sanitation, target fonts/templates and acceptance must also support the pair.
-The old distribution name was `translate-en-ru-pdf-latex`; install this renamed
-skill only once, not alongside a duplicate copy. See README for language scope.
 For a newly unpacked user distribution, start with `ЧИТАТЬ_ПЕРВЫМ.md`.
-Other companion skills are optional expert workflows, not runtime dependencies.
-The separate 26-skill collection is catalogued in `docs/COMPANION_SKILLS.md`;
-its files are published in the repository's `companion-skills/` folder and a
-separate release ZIP, not bundled inside the main skill ZIP.
+Five optional companion workflows ship under `companion-skills/`; load only the
+one relevant to the current task. The full historical collection and this new
+diagnostic workflow are catalogued in `docs/COMPANION_SKILLS.md`. All use the
+current project's scripts; do not replace them with older bundled engines.
+Current simple books/skeleton routes accept
+EN->RU; prepared OCR is verified for DE->RU. MT language flags do not establish
+full arbitrary-language PDF support. Public name: `translate-pdf-latex`.
 
-If terminology preparation is requested, read the glossary section in `README.md`.
-Prepare/review a compact UTF-8 `glossary.md` beside the input BEFORE `init`; the
-job snapshots it. It may be prepared manually or with an explicitly chosen model.
-Do not silently generate one or send book text to a cloud assistant. Freeze it
-during a run; changed terminology needs a new input/job, not edits to `JOB/input`.
+The old distribution name was `translate-en-ru-pdf-latex`; keep only one active
+installation. If terminology preparation is requested, read the glossary section
+in `README.md`. Prepare/review a compact UTF-8 `glossary.md` beside the input
+BEFORE `init`; the job snapshots it. Do not silently generate one or send book
+text to a cloud assistant. Changed terminology needs a new input/job, not edits
+to `JOB/input`. The complete optional collection is a separate release archive.
 
 ```text
 python scripts/pipeline.py init INPUT --out NEW_JOB_FOLDER
@@ -59,6 +57,20 @@ logs and session limits. `status` is read-only and makes no model calls.
 `done` means checked technical output, not scholarly or literary certification.
 Repeat `run` after resolving a reported issue; retained caches are revalidated.
 Do not relaunch if status is `running`, or if an orphan child is still alive.
+
+For a progress question, slow work or repeated failures, first run
+`python scripts/diagnose_pipeline.py JOB`. It reads bounded local evidence and
+does not call a model, launch work or modify the job. A growing log is activity,
+not proof of accepted translation. Follow
+[translation-pipeline-diagnostics](companion-skills/translation-pipeline-diagnostics/SKILL.md)
+when the cause needs investigation. A status request alone is not a resume request.
+
+Accepted requests/paragraph fragments are checkpointed immediately; a rejected
+group does not discard its verified bodies. Resume revalidates cache entries
+under the current policy. Do not erase caches, edit hashes or resubmit whole books
+in a loop. See [incremental MT](docs/INCREMENTAL_MT.md) for stage identities,
+bounded retries and recovery from interrupted builds. Use the existing bounded
+queue only for a requested queue, not as an automatic response to any failure.
 
 For a different local endpoint/model, pass JSON to `init --settings FILE`:
 
@@ -100,6 +112,10 @@ For normal runs read only [docs/LOCAL_AGENT.md](docs/LOCAL_AGENT.md), when neede
 - Foreign skeleton options/printed folios: `skeleton/README.md`.
 - Optional cloud/polish or configurations: `КОНФИГУРАЦИИ.md`.
 - Code maintenance/deep diagnosis: `АГЕНТ.md`, `tests/run_smoke.py`.
+- Local MT repair: [local-mt-batch](companion-skills/local-mt-batch/SKILL.md).
+- Endpoint/context/throughput: [local-llm-lmstudio](companion-skills/local-llm-lmstudio/SKILL.md).
+- LaTeX failures: [latex-build-doctor](companion-skills/latex-build-doctor/SKILL.md).
+- Requested terminology work: [translation-glossary-builder](companion-skills/translation-glossary-builder/SKILL.md).
 
 The portable package includes the same scripts/assets. Sync it with
 `scripts/sync_skill.py --dest DESTINATION`; changed files are backed up.

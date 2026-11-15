@@ -456,7 +456,12 @@ def run_job(root):
             state.pop("child_pid", None)
             state.pop("child_started", None)
             if rc:
+                from pipeline_queue import classify_failure
+                with log.open("rb") as stream:
+                    stream.seek(max(0, log.stat().st_size - 65536))
+                    failure = classify_failure(stream.read().decode("utf-8", errors="replace"), rc)
                 state.update(status="needs_attention", returncode=rc, next_action="inspect_log_then_run",
+                             failure=failure, retryable=failure in ("offline", "transient"),
                              reason="stage refused; cached successes retained; no automatic cloud/polish/force")
                 write_json(root / STATE, state)
                 return rc if rc in (3, 4, 5, 124) else 1

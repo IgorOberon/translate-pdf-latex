@@ -120,7 +120,7 @@ def translate_once(tmp_path, monkeypatch, native_responses, *, source_text="The 
         assert body is None, "guard must never load/change models"
         probes.append(path)
         return next(responses)
-    def generate(host, model, messages, temperature, top_p):
+    def generate(host, model, messages, temperature, top_p, **kwargs):
         generations.append(messages)
         return "Сосуд содержит воду."
     monkeypatch.setattr(runtime, "_http_json", native)

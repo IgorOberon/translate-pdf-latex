@@ -193,12 +193,20 @@ def _compile_locked(main, output, engine, max_passes, runner, report):
     if state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if (state.get("schema") != 1 or state.get("main") != str(main)
-                or state.get("engine") != engine or state.get("status") == "passed"):
+                or state.get("engine") != engine):
             raise ValueError("completed or foreign candidate; use a fresh build directory")
         _check_inputs(state["inputs"])
         if any(state["inputs"].get(path) != digest for path, digest in inputs.items()):
             raise ValueError("TeX input set changed; use a fresh candidate directory")
         checkpoint = _checkpoint(output, state)
+        if state.get("status") == "passed":
+            old = state["report"]
+            if (not checkpoint or not (output / pdf_name).is_file()
+                    or sha_file(output / pdf_name) != old.get("pdf_sha256")
+                    or not (output / log_name).is_file()
+                    or sha_file(output / log_name) != state["checkpoint"]["files"].get(log_name)):
+                raise ValueError("completed candidate changed; use a fresh build directory")
+            return dict(old, reused=True)
         if (output / pdf_name).exists() and not state.get("publishing"):
             raise ValueError("candidate PDF already exists; use a fresh build directory")
         report = state["report"]
@@ -258,6 +266,8 @@ def _compile_locked(main, output, engine, max_passes, runner, report):
             state["inputs"].update(recorded)
             row["aux_sha256"] = aux_state(attempt)
             log_text = read_tex_log(attempt / log_name)
+            if "Missing character:" in log_text:
+                raise ValueError("Missing character in first affected TeX pass; fix fonts/math before retry")
             rerun = bool(re.search(r"Rerun to get|Label\(s\) may have changed|Please rerun", log_text, re.I))
             # A ToC is first populated by pass 1, then read by pass 2. Compare
             # pass 2 with pass 3 before accepting its printed page destinations.

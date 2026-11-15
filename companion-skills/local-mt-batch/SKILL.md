@@ -1,118 +1,90 @@
 ---
 name: local-mt-batch
 description: >-
-  Machine-translate a large document (book, manual, transcript) through a LOCAL
-  specialized MT model (Hy-MT2 class via LM Studio/llama.cpp server) reliably:
-  formula/code masking, block splitting, resumable per-block caching, glossary
-  injection, parallel requests, and round-trip verification. Use when the user
-  wants a free/private bulk translation on their own GPU instead of an agent
-  writing the prose (that is translate-book-to-latex), mentions Hy-MT2 / «перевести
-  книгу локальной моделью» / a translation that must survive interruptions, or
-  when a local MT run misbehaves: the model translates the glossary itself,
-  outputs 2000 tokens per paragraph, mangles formulas, or restarts from zero
-  after a crash.
+  Run and resume bulk document translation with a local MT model. Use for
+  interrupted translation, rejected paragraphs, formula masking, glossary
+  injection, repeated requests or excessive MT work. In translate-pdf-latex
+  projects use the current pipeline engine and its validated fragment cache.
 ---
 
-# Batch MT through a local model — the engine-side discipline
+# Resumable local machine translation
 
-The complementary route to agent translation: a specialized MT model performs
-bulk translation locally, without a per-token cloud bill. Speed and quality
-depend on the book, model and hardware. Glossary adherence is not guaranteed;
-polishing is optional. Caching reduces rework, not all possible failures.
+Locate the user's active project and read its AGENTS.md and SKILL.md. In a
+translate-pdf-latex project, use that project's interpreter and
+`scripts/pipeline.py init`, `plan`, `run`, `status`. The project owns the engine.
+Historical scripts beside an installed copy of this skill must not replace it.
+Outside that project, identify the actual translator and its resume contract
+before applying these principles; do not invent compatible flags or receipts.
 
-For the current `translate-pdf-latex` project, use its `pipeline.py` and current
-scripts. The scripts here are historical standalone references, not replacements
-for its acceptance gates, process management or cache validation.
+## Preserve the source and request identity
 
-Working reference implementations ship with the skill: `scripts/mask_math.py`
-(§1) and `scripts/translate.py` (§2–3, both prompt modes). Where this engine
-sits in the whole book pipeline — extraction to compiled PDF — is drawn in
-`references/pipeline.md`.
+Keep original books, accepted caches, maps and reports. Cleaning must record
+source-bound decisions; an index, contents, footnote or CJK quotation is not
+disposable merely because it complicates translation. Inspect suspicious OCR
+against its source. Prose accidentally captured inside display math needs
+extraction/masking repair before it can be considered translated.
 
-## 1. Mask everything the model must not touch
+Mask formulas, code, references and URLs; retain the exact map. Masking protects
+identified spans, not OCR accuracy or text that masking missed. Check token ID,
+count and order on every response and after assembly. A known bracket repair
+must preserve the original ID and pass all other checks. Unresolved tokens,
+missing notes, changed numbers or lost table cells prevent release.
 
-Before translation, replace every formula (`$…$`, `$$…$$`, LaTeX environments),
-code span/block, `\ref{…}`/`\eqref{…}`, and URL with an opaque token
-`⟦M000123⟧` (any short unique scheme works); store the token→original map as
-JSON. The model receives prose + tokens and one rule: copy tokens unchanged.
-`scripts/mask_math.py mask|unmask <in> <out> <map.json>` does exactly this.
+Agree the glossary before a long run when requested. Do not change language,
+model, endpoint, prompt, glossary or splitting settings just to obtain a cache
+hit. A change may legitimately invalidate a request. Old cache entries remain
+evidence; never rewrite their hashes to make them match.
 
-- After translation, substitute back byte-for-byte and **verify**: zero tokens
-  may remain in the output. `N placeholders left` = the model damaged a token;
-  locate `⟦M` in the translated file, fix that block, rerun (cache makes it
-  cheap).
-- Masking protects captured payloads but does not prove that extraction captured
-  every formula or that the model preserved every token. Check token identities,
-  counts and protected structures, not only zero unresolved placeholders.
+## Resume at the smallest verified unit
 
-## 2. Blocks, cache, resume
+The current engine stores accepted requests immediately in `fragments-v1`.
+If a grouped response has exact paragraph IDs, order and nonempty boundaries,
+independently valid paragraph bodies can also be retained. Only rejected bodies
+need isolated translation. Ambiguous, missing or reordered boundaries are not
+permission to guess an alignment or salvage text under the wrong ID.
 
-All of this section and §3 is implemented in `scripts/translate.py`
-(`--mode hymt` for fixed-template MT models, `--mode generic` for ordinary
-LLMs; `--glossary`, `--parallel`, per-block `.tcache`).
+Whole-group cache hits, fragment hits and previous-report fast paths all pass
+the current validator. A stricter policy may reject an old result. Good earlier
+requests survive failure or interruption of a later request. New alternatives
+to a legacy group entry are append-only revisions; the old entry is preserved.
+Identical concurrent requests use one producer within the process.
 
-- Split on blank lines into paragraph blocks; skip untranslatable blocks
-  (pure-token lines, tables of numbers) without an API call.
-- Cache each result on disk keyed by
-  `hash(prompt_version + mode + model + target_lang + glossary + block)`.
-  Consequences you rely on:
-  - **any crash/Ctrl+C is free** — rerun the same command, cached blocks fly by;
-  - **editing the glossary invalidates everything** (it is in the key) — freeze
-    it before the long run;
-  - **changing the prompt layout must bump prompt_version**, or poisoned old
-    outputs (e.g. from a bad layout that translated the glossary) get reused.
-- The historical helper can retain SOURCE after exhausted retries. Treat that
-  result as incomplete, not accepted translation. Current pipeline runs must
-  use their fail-fast and acceptance checks; preserve cache and resolve failures.
+On failure, read the report rather than restarting the entire book in a loop:
 
-## 3. The prompt contract for fixed-template MT models
+| Evidence | Action |
+|---|---|
+| One bad paragraph, stable boundaries | Let the engine retain valid bodies and retry only the bad body |
+| Interrupted request | Resume unchanged inputs from verified checkpoints |
+| Permanent HTTP 4xx or insufficient context | Correct the documented cause before another run |
+| Refused endpoint | Restore/check the endpoint; do not resubmit all remaining blocks |
+| Disk write error | Resolve storage first; it is not a model-quality error |
+| Same validation failure after bounded fallback | Preserve evidence and inspect that unit; do not accept the least-bad reply |
 
-Specialized MT models are trained on a rigid template like
-`Translate the following segment into <lang>, without additional explanation.\n\n<text>`
-and treat EVERYTHING after the instruction as payload.
+`translate.py` exit 4 means a partial candidate with failed blocks; exit 3
+means aborted work whose new output was not published. Neither means a release.
+`pipeline.py status` and the final release receipt determine technical completion.
+Intentional unchanged passages require the existing explicit source-preservation
+policy; a retry failure does not create such a policy.
 
-- Auxiliary material (token-copy rule, glossary) goes in the **system message**;
-  the user message stays exactly on-template. Violating this makes the model
-  translate your glossary line by line — the signature symptom is
-  completion_tokens ≈ 2000 for a 3-line paragraph.
-- Hybrid thinking models: prefix the user message with `/no_think` (silent
-  chain-of-thought otherwise burns 10–20x time per block).
-- Sampler per the model card (Hy-MT2: temp 0.7, top_p 0.6, top_k 20, repeat
-  penalty 1.05), saved as the model's server-side defaults.
+For slow/repeated work, run the project's `scripts/diagnose_pipeline.py JOB`.
+Read `docs/INCREMENTAL_MT.md` and `docs/INTEGRITY.md` in that project only when
+repair/resume details are needed. Do not manually edit cache or coverage reports.
 
-## 4. Throughput
+## Prompt size and measured throughput
 
-- Healthy: 1–5 s per paragraph block (7B Q8 on a 16 GB GPU). 30–60 s per block
-  means thinking mode, glossary-echo, or CPU inference — diagnose via server
-  logs (prompt/completion token counts tell which).
-- The server runs N parallel slots; 3 concurrent requests ≈ 3x. Preserve output
-  ORDER (map results by block index, not completion order). If long blocks
-  start failing only under parallelism, the context is split across slots —
-  raise it or drop to sequential.
-- Book-scale expectation: ~6000 blocks ≈ 2–5 hours with parallel=3.
+Keep the specialized model's configured prompt template. Auxiliary glossary and
+token-copy instructions belong where that template expects them; do not append
+instructions to the payload. The current pipeline selects relevant terms and
+critical entries while retaining the complete glossary for validation.
 
-## 5. Glossary injection
+Measure useful accepted text, request latency, prompt/output tokens, retry share
+and cache reuse on comparable samples. Busy VRAM, a process being alive, or a
+growing log alone does not establish useful progress. Parallelism is a measured
+setting, not a promised multiplier. Verify per-request context rather than
+dividing an advertised model limit by a guessed slot count. Preserve the user's
+chosen model and local-only/no-polish settings; no automatic cloud fallback.
 
-One `term => перевод` per line in the system message under a strict-use
-instruction. Build and curate it with **translation-glossary-builder** (what to
-include, collision traps, size budget ~30–130 lines, name transliteration).
-
-## 6. Verification before typesetting
-
-1. Unmask reports zero leftover placeholders.
-2. Tail of the translated file shows the END of the book (index/bibliography),
-   in the target language — proves completeness better than any counter.
-3. Spot-read 3–5 blocks from the middle: fluent target prose, terms per
-   glossary, tokens untouched.
-4. Then run translation-consistency-audit across chapters, and optionally
-   translation-literary-edit-pass for style.
-
-## Companion skills
-
-- **translation-glossary-builder** — the terminology fed into every request.
-- **local-llm-lmstudio** — server ops: proxy bypass, JIT/eject VRAM
-  choreography, KV-cache math, parallel slots.
-- **translate-book-to-latex** — the agent-writes-the-prose alternative when
-  quality matters more than cost/speed; both routes share figures/LaTeX skills.
-- **translation-consistency-audit / translation-literary-edit-pass** — the QA
-  and polish passes after this engine finishes.
+Before release, verify source/target coverage, formulas, figures, notes and
+failed/kept-source counts through the normal acceptance path. Script/language
+heuristics and fluent samples do not prove semantic completeness. Semantic
+editing and stylistic polish remain separately requested work.

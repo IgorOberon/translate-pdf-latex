@@ -24,8 +24,10 @@ from provenance import inside, sha_file, write_json, atomic_text
 
 NAME = "Конвейер-перевода-книг"
 SKILL_NAME = "translate-pdf-latex"
-DIRS = ("scripts", "assets", "skeleton", "tests")
+DIRS = ("scripts", "assets", "skeleton", "tests", "companion-skills")
 DOCS = [
+    ".gitattributes", ".gitignore", "LICENSE", "CONTRIBUTING.md", "SECURITY.md",
+    "THIRD_PARTY.md", "CHANGELOG.md", "docs/VALIDATION.md",
     "docs/COMPANION_SKILLS.md",
     "AGENTS.md", "PIPELINE_REFERENCE.md", "ПРОМПТ_РУЧНЫЕ_СТАДИИ.md",
     "docs/LOCAL_AGENT.md", "docs/ARTICLE_IDEAS.md",
@@ -37,6 +39,9 @@ DOCS = [
     "ОТЧЁТ_КОНВЕЙЕР.md", "ОТЧЁТ_NFCM_ДЕФЕКТЫ_КОНВЕЙЕРА.md",
     "glossary.example.md", "glossary_de.md",
     "docs/INTEGRITY.md",
+    "docs/INCREMENTAL_MT.md",
+    "docs/LIVE_HYMT_CACHE_CHECK.md",
+    "docs/LIVE_HYMT_INTERRUPT_CHECK.md",
     "docs/опыт-тома-6/README.md", "docs/опыт-тома-6/01_ОПЫТ_ТОМА_6.md",
     "docs/опыт-тома-6/02_ЗАДАНИЕ_НА_ОБНОВЛЕНИЕ.md",
     "docs/опыт-тома-6/03_ПРОМПТ_ДЛЯ_ДРУГОЙ_СЕССИИ.md",
@@ -46,6 +51,16 @@ DOCS = [
 ]
 # Explicitly reviewed new source files, before their first git commit.
 ADDITIONS = {
+    "scripts/diagnose_pipeline.py", "tests/test_pipeline_diagnostics.py",
+    "companion-skills/local-mt-batch/SKILL.md",
+    "companion-skills/local-llm-lmstudio/SKILL.md",
+    "companion-skills/latex-build-doctor/SKILL.md",
+    "companion-skills/latex-build-doctor/references/failure-cases.md",
+    "companion-skills/translation-glossary-builder/SKILL.md",
+    "companion-skills/translation-pipeline-diagnostics/SKILL.md",
+    "companion-skills/translation-pipeline-diagnostics/agents/openai.yaml",
+    "scripts/fragment_cache.py", "scripts/stage_checkpoints.py", "scripts/pipeline_queue.py",
+    "tests/test_incremental_mt.py", "tests/test_stage_checkpoints.py",
     "scripts/background_run.py", "scripts/windows_tasks.py", "scripts/windows_task.ps1",
     "scripts/lmstudio_runtime.py", "tests/test_background_run.py",
     "scripts/managed_model_guard.py", "tests/test_managed_model_guard.py",
@@ -76,7 +91,7 @@ ADDITIONS = {
 }
 SKIP_SCRIPTS = {"escape_dollars.py", "fix_map_english.py"}
 SKIP_DIRS = {"__pycache__", ".git", ".tcache", ".pytest_cache", "fixtures"}
-SOURCE_SUFFIXES = {".py", ".sh", ".tex", ".lua", ".md", ".json", ".ps1"}
+SOURCE_SUFFIXES = {".py", ".sh", ".tex", ".lua", ".md", ".json", ".ps1", ".yaml"}
 SECRET_NAME = re.compile(r"(^|[._-])(token|secret|credential|password|apikey|api_key)s?([._-]|$)|\.(pem|key|pfx|env)$", re.I)
 # High-confidence formats only; never echo detected values.
 SECRET_CONTENT = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|"
@@ -125,7 +140,10 @@ def package_files(root=ROOT, profile=None):
         tracked = set(json.loads(inventory.read_text(encoding="utf-8"))["files"])
     paths = (tracked | ADDITIONS) - {""}
     selected = {name for name in paths if Path(name).parts[0] in DIRS
-                and want(Path(name)) and inside(root, name).is_file()}
+                and want(Path(name)) and inside(root, name).is_file()
+                # The public repository also tracks the full historical collection.
+                # Only reviewed current workflows belong in the pipeline archive.
+                and (not name.startswith("companion-skills/") or name in ADDITIONS)}
     # Current canonical docs only; not historical book commands or old manual PDF.
     for name in selected_docs(profile):
         if not inside(root, name).is_file():

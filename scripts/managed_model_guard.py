@@ -72,7 +72,8 @@ def inspect_model(data, requested, estimated_tokens, declared_context=0, *, allo
     return observed
 
 
-def check_managed_model(host, model, messages, context_per_request=0, *, phase="before", previous=None):
+def check_managed_model(host, model, messages, context_per_request=0, *,
+                        phase="before", previous=None, reply_tokens=4096):
     """Check only managed endpoints; ordinary compatible servers are unchanged."""
     path = os.environ.get("FREETRANSLATE_MANAGED_LMSTUDIO_RECEIPT")
     if not path and previous is None:
@@ -97,7 +98,9 @@ def check_managed_model(host, model, messages, context_per_request=0, *, phase="
         if base != expected_base:
             raise ManagedModelError("managed live runtime does not match the requested endpoint")
         data = runtime._http_json(base, "/api/v1/models")
-        result = inspect_model(data, model, estimate_messages(messages), context_per_request,
+        result = inspect_model(
+            data, model, estimate_messages(messages, reply_tokens=reply_tokens),
+            context_per_request,
                                allow_unloaded=phase == "before")
         if phase == "after":
             if not isinstance(previous, dict) or previous.get("state") not in ("loaded", "unloaded"):

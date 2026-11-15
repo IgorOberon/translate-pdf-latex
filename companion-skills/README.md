@@ -1,14 +1,17 @@
-# 26 дополнительных скиллов
+# 27 дополнительных скиллов
 
-Это **сами файлы коллекции**, а не только каталог: 26 папок, в каждой — `SKILL.md`
+Это **сами файлы коллекции**, а не только каталог: 27 папок, в каждой — `SKILL.md`
 и необходимые для неё `scripts/`, `references/` или `assets/`.
 Основной конвейер `translate-pdf-latex` находится отдельно, в корне репозитория.
-Вместе с ним получается 27 скиллов. Для обычного перевода локальной моделью
-достаточно основного; устанавливать все 26 не требуется.
+Вместе с ним получается 28 уникальных скиллов. Для обычного перевода локальной
+моделью достаточно основного; устанавливать всю коллекцию не требуется.
+В beta.5 обновлены `local-mt-batch`, `local-llm-lmstudio`, `latex-build-doctor`,
+`translation-glossary-builder`; добавлен `translation-pipeline-diagnostics`.
+Эти пять инструкций также входят в основной ZIP. Дубликаты не устанавливайте.
 
 ## Скачать и установить
 
-1. В [Releases](https://github.com/IgorOberon/translate-pdf-latex/releases/tag/v0.1.0-beta.3)
+1. В [Releases](https://github.com/IgorOberon/translate-pdf-latex/releases/tag/v0.1.0-beta.5)
    скачайте `companion-skills.zip` и его `.sha256`. Основной конвейер скачивается
    отдельно как `translate-pdf-latex.zip`.
 2. Проверьте SHA-256 архива (`Get-FileHash .\companion-skills.zip -Algorithm SHA256`)
@@ -36,6 +39,7 @@
 | [pdf-book-extraction](pdf-book-extraction/SKILL.md) | Извлечение текста, формул и рисунков |
 | [pdf-text-layer-trap](pdf-text-layer-trap/SKILL.md) | Скрытые потери в текстовом слое PDF |
 | [local-mt-batch](local-mt-batch/SKILL.md) | Локальный пакетный перевод |
+| [translation-pipeline-diagnostics](translation-pipeline-diagnostics/SKILL.md) | Прогресс, повторные запросы, сбои и безопасное возобновление |
 | [local-llm-lmstudio](local-llm-lmstudio/SKILL.md) | LM Studio и память GPU |
 | [windows-python-env](windows-python-env/SKILL.md) | Python/venv, PATH и кодировки Windows |
 | [translation-glossary-builder](translation-glossary-builder/SKILL.md) | Подготовка и проверка глоссария |
@@ -77,11 +81,13 @@
 
 ## Состав поставки и проверка
 
-Коллекция подготовлена из 26 исходных папок, без `evals`, инструментария
+Историческая коллекция подготовлена из 26 исходных папок, без `evals`, инструментария
 `skill-creator`, кэшей и книжных изображений. В генератор глоссария добавлен
 недостающий локальный `mask_math.py`; текстовая инструкция о глоссарии уточнена
 для нового диспетчера. Структура скиллов и синтаксис Python проверены; это не
-полный функциональный тест всех 26 экспертных сценариев.
+полный функциональный тест всех экспертных сценариев. В beta.5 добавлена
+одна папка диагностики; четыре обновлённые инструкции используют основной движок,
+а сохранённые исторические скрипты не являются рекомендуемым обходным маршрутом.
 
 `collection.manifest.json` содержит список скиллов и SHA-256 каждого файла.
 Лицензия авторских инструкций и скриптов — [MIT](LICENSE). Лицензии используемых

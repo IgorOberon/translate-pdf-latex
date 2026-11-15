@@ -48,13 +48,14 @@ from urllib.parse import urlsplit, urlunsplit
 
 from glossary_selection import load_profile, select_glossary
 from request_plan import PLANNER_VERSION, plan_fragments
-from request_budget import check_messages
+from request_budget import check_messages, output_tokens_for, RequestBudgetError
 from managed_model_guard import check_managed_model, ManagedModelError
 from attempt_journal import AttemptJournal, current_attempt
 import paragraph_units as paragraphs
 from provenance import atomic_text, canonical_hash, sha_file, sha_text, write_json
+from fragment_cache import FragmentCache, group_entries, save_group
 
-print(">> translate.py v4 (unified validator, v5 cache, provenance, shared request plan)",
+print(">> translate.py v4 (adaptive context, unified validator, v5 cache, provenance)",
       flush=True)
 
 from endpoint_policy import model_opener
@@ -325,14 +326,18 @@ def api_url(host):
     return h + "/v1/chat/completions"
 
 
-def call_api(host, model, messages, temperature, top_p):
+class ContextLimitError(RuntimeError):
+    """The local server rejected a request before producing a translation."""
+
+
+def call_api(host, model, messages, temperature, top_p, max_tokens=4096):
     payload = {
         "model": model,
         "messages": messages,
         "stream": False,
         "temperature": temperature,
         "top_p": top_p,
-        "max_tokens": 4096,
+        "max_tokens": int(max_tokens),
     }
     # облачные OpenAI-совместимые эндпоинты требуют настоящий ключ
     token = os.environ.get("LLM_API_KEY") or "local"
@@ -353,9 +358,12 @@ def call_api(host, model, messages, temperature, top_p):
                 trace.response(raw, status=getattr(r, "status", None),
                                elapsed_seconds=time.monotonic() - started)
     except urllib.error.HTTPError as exc:
+        raw_error = exc.read()
         if trace:
-            trace.response(exc.read(), status=exc.code,
+            trace.response(raw_error, status=exc.code,
                            elapsed_seconds=time.monotonic() - started)
+        if b"Context size has been exceeded" in raw_error:
+            raise ContextLimitError("context size exceeded") from exc
         raise
     except http.client.IncompleteRead as exc:
         if trace:
@@ -498,9 +506,20 @@ def numeric_evidence(text):
         # Suffix-bearing ordinals may be written as digits or Russian words.
         ordinal = any(a == m.start() and b >= m.end() for a, b in ordinal_spans)
         prefix, suffix = text[:m.start()], text[m.end():]
-        code = (re.search(r"[\w.][-–—]?$", prefix)
-                or re.match(r"[A-Za-zА-Яа-я]", suffix)
-                or re.search(r"[§#]\s*$", prefix))
+        # A letter-led code such as ``ST-36`` must stay exact, but a numeric
+        # range endpoint in ``1–3`` is not a code.  The old ``\w`` pattern
+        # treated the preceding ``1`` as a code prefix and rejected harmless
+        # prose normalization like ``1 through 3`` -> ``1–3``.
+        # MinerU can join an ordinary preposition to a following numeral
+        # (``of0``/``in2``).  That is OCR prose, not a letter-led code such as
+        # ``ST-36``; do not require the target to preserve the English
+        # preposition when comparing numeric evidence.
+        attached_ocr_number = re.search(
+            r"\b(?:of|to|in|at|on)$", prefix, re.IGNORECASE)
+        code = ((re.search(r"[A-Za-z_]\w*[-–—]?$", prefix)
+                 or re.match(r"[A-Za-zА-Яа-я]", suffix)
+                 or re.search(r"[§#]\s*$", prefix))
+                and not attached_ocr_number)
         if not ordinal and (code or "." in m[0] or "," in m[0]):
             protected[m[0].replace(",", ".")] += 1
     words = Counter({str(n): len(RU_NUMBER_WORDS[n].findall(text))
@@ -545,6 +564,52 @@ class Candidate:
         return not self.reasons
 
 
+_FORMULA_PROSE_WORDS = {
+    "a", "an", "and", "are", "as", "at", "by", "for", "from",
+    "if", "in", "is", "let", "of", "on", "or", "the", "then",
+    "that", "to", "under", "where", "with",
+}
+
+
+def is_formula_only_fragment(source):
+    """Return True for dense masked notation without ordinary prose.
+
+    A formula/index inventory may be intentionally identical after translation.
+    Keep all structural, mask and numeric checks, but do not reject its exact
+    notation as an English echo.  Paragraph protocol wrappers and one-level
+    LaTeX commands are structural and are excluded from the word scan.
+    """
+    if len(PLACEHOLDER_RE.findall(source)) < 12:
+        return False
+    plain = PLACEHOLDER_RE.sub(" ", source)
+    plain = re.sub(r"⟦/?P[^⟧]+⟧", " ", plain)
+    plain = re.sub(r"\\[A-Za-z]+\s*\{[^{}]*\}", " ", plain)
+    plain = re.sub(r"\\[A-Za-z]+", " ", plain)
+    words = re.findall(r"(?<![A-Za-z])[A-Za-z]{2,}(?![A-Za-z])", plain)
+    return not any(word.lower() in _FORMULA_PROSE_WORDS for word in words)
+
+
+def is_formula_inventory(source):
+    """Return True for a dense notation dictionary/index row."""
+    return (len(PLACEHOLDER_RE.findall(source)) >= 30
+            and len(source) >= 600)
+
+
+def validation_policy_for(source, policy):
+    policy = policy or ValidationPolicy()
+    if (not policy.reject_echo
+            or (not is_formula_only_fragment(source)
+                and not is_formula_inventory(source))):
+        return policy
+    return ValidationPolicy(
+        min_ratio=policy.min_ratio,
+        length_min_chars=policy.length_min_chars,
+        reject_cjk=policy.reject_cjk,
+        reject_echo=False,
+        mode=policy.mode,
+    )
+
+
 def added_cjk(source, reply):
     # A single quoted name must not whitelist an arbitrary hallucinated paragraph.
     return bool(Counter(CJK_RE.findall(reply)) - Counter(CJK_RE.findall(source)))
@@ -571,8 +636,14 @@ def structural_literals(text):
     text = PLACEHOLDER_RE.sub("", text)
     content = LIST_MARKER.sub(" ", text)
     content = ORDINAL.sub(lambda m: re.match(r"\d+", m[0])[0], content)
+    # Labels can be inline as well as line-leading. Exclude function arguments
+    # such as im(γ), but never drop the inline alpha/beta/gamma omission gate.
+    enum_matches = re.findall(
+        r"(?<![\w(])(?:\(([Ͱ-Ͽ])\)|([Ͱ-Ͽ])[).])(?=\s|$)", text)
+    enum_labels = Counter(next(value for value in pair if value)
+                          for pair in enum_matches)
     return {"numbers": Counter(re.findall(r"\d+", content)),
-            "enumeration labels": Counter(re.findall(r"(?<!\w)([Ͱ-Ͽ])[).]", text)),
+            "enumeration labels": enum_labels,
             "footnote IDs": Counter(re.findall(r"\[\^([^\]]+)\]", text))}
 
 
@@ -659,13 +730,17 @@ def plan_translation_fragments(block, split_chars=0, paragraph_members=None):
 
 def validate_fragment(fragment, reply, policy=None, glossary=""):
     if "paragraphs" not in fragment:
-        return validate_candidate(fragment["text"], reply, policy, glossary)
+        return validate_candidate(
+            fragment["text"], reply,
+            validation_policy_for(fragment["text"], policy), glossary)
     parts = fragment["paragraphs"]
     try:
         bodies = paragraphs.parse_response(reply, parts)
     except ValueError as exc:
         return Candidate("", (str(exc),))
-    checked = [validate_candidate(part["text"], body, policy, glossary)
+    checked = [validate_candidate(
+                   part["text"], body,
+                   validation_policy_for(part["text"], policy), glossary)
                for part, body in zip(parts, bodies)]
     reasons = tuple(f"paragraph {part['id']}: {reason}"
                     for part, result in zip(parts, checked) for reason in result.reasons)
@@ -682,12 +757,41 @@ def assemble_translation(block, fragments, pieces, policy, glossary, members=Non
         for part, body in zip(fragment["paragraphs"],
                               paragraphs.parse_response(piece, fragment["paragraphs"])):
             by_id[part["id"]].append(body)
-    checked = [validate_candidate(row["text"], " ".join(by_id[row["id"]]), policy, glossary)
+    checked = [validate_candidate(
+                   row["text"], " ".join(by_id[row["id"]]),
+                   validation_policy_for(row["text"], policy), glossary)
                for row in members]
     reasons = tuple(f"paragraph {row['id']}: {reason}"
                     for row, candidate in zip(members, checked) for reason in candidate.reasons)
     bodies = [paragraphs.render_paragraph(c.text) for c in checked]
     return Candidate("\n\n".join(bodies), reasons, any(c.repaired for c in checked)), bodies
+
+
+def reusable_plain_stage(src, dst, config, policy, glossary=""):
+    """Validate accepted units in a repair-stage receipt under today's rules.
+
+    Failed units are evidence for a different fallback strategy, never accepted
+    translations. Only a raw, ungrouped result with exact identities qualifies.
+    """
+    from provenance import check_result
+    try:
+        report = check_result(src, dst)
+        if (report["request_config_sha256"] != canonical_hash(config)
+                or config.get("group_chars") or report.get("allowed_source")
+                or report.get("output_sha256") != sha_file(dst)):
+            return False
+        sources = split_blocks(Path(src).read_bytes().decode("utf-8"))
+        outputs = split_blocks(Path(dst).read_bytes().decode("utf-8"))
+        if len(sources) != len(outputs) or report.get("blocks_total") != len(sources):
+            return False
+        failed = {int(row["index"]) for row in report.get("failed_blocks", [])}
+        if any(i < 1 or i > len(sources) for i in failed):
+            return False
+        return all(i in failed or not is_translatable(source) or validate_candidate(
+            source, target, validation_policy_for(source, policy), glossary).ok
+            for i, (source, target) in enumerate(zip(sources, outputs), 1))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def main():
@@ -808,12 +912,113 @@ def main():
                               reject_echo=reject_echo, mode=a.mode)
     config = request_config(a, glossary, glossary_profile)
     config_hash = canonical_hash(config)
+    fragment_cache = FragmentCache(a.cache_dir, config)
     if not a.context_per_request:
         sys.stderr.write("?? per-request runtime context unknown; no capacity confirmation\n")
     journal = AttemptJournal(Path(str(a.dst) + ".attempts"), metadata={
         "source_sha256": source_hash, "request_config_sha256": config_hash,
         "context_per_request": a.context_per_request, "model": a.model})
+    # Fast resume for grouped books: the previous report already records a
+    # cryptographically bound paragraph coverage map and the output hash.  If
+    # source/config/output are unchanged, revalidate those spans once and
+    # reuse every accepted group directly.  Only failed_blocks then reach the
+    # cache/model loop; this avoids rereading hundreds of large JSON request
+    # caches on every targeted-repair cycle.
+    previous_reused = set()
+    previous_report_path = Path(str(a.dst) + ".report.json")
+    if paragraph_groups is not None and previous_report_path.is_file() and Path(a.dst).is_file():
+        try:
+            previous = json.loads(previous_report_path.read_text(encoding="utf-8"))
+            # Keep CRLF byte positions exactly as translate.py does for the
+            # current source; read_text() would normalize newlines and make
+            # the coverage offsets look stale.
+            previous_text = Path(a.dst).read_bytes().decode("utf-8")
+            previous_rows = previous.get("paragraph_coverage")
+            previous_failed = {
+                int(row["index"])
+                for row in previous.get("failed_blocks", [])
+                if isinstance(row, dict) and str(row.get("index", "")).isdigit()
+            }
+            reusable = (
+                previous.get("source_sha256") == source_hash
+                and previous.get("request_config_sha256") == config_hash
+                and previous.get("blocks_total") == n
+                and previous.get("output_sha256") == sha_text(previous_text)
+                and isinstance(previous_rows, list)
+                and len(previous_rows) == sum(len(group) for group in paragraph_groups)
+                and previous.get("source_preservation_sha256") == preservation_hash
+            )
+            if reusable and a.target_lang.strip().lower() == "russian":
+                letters = re.findall(r"[A-Za-zА-Яа-яЁё]", previous_text)
+                cyrillic = re.findall(r"[А-Яа-яЁё]", previous_text)
+                # A prior interrupted/buggy resume must not turn an English
+                # output into trusted evidence merely because its spans hash.
+                reusable = (len(letters) <= 2000
+                            or len(cyrillic) / len(letters) >= 0.5)
+            rows_by_group = {}
+            if reusable:
+                for row, source in zip(
+                        previous_rows,
+                        [part for group in paragraph_groups for part in group]):
+                    start, end = row.get("output_start"), row.get("output_end")
+                    reusable = (
+                        row.get("id") == source.get("id")
+                        and row.get("source_index") == source.get("source_index")
+                        and row.get("source_sha256") == source.get("source_sha256")
+                        and isinstance(start, int) and isinstance(end, int)
+                        and 0 <= start < end <= len(previous_text)
+                        and sha_text(previous_text[start:end]) == row.get("output_sha256")
+                    )
+                    if not reusable:
+                        break
+                    rows_by_group.setdefault(int(row["group_index"]), []).append(
+                        previous_text[start:end])
+            if reusable:
+                paragraphs.verify_coverage(split_blocks(text), blocks,
+                                           previous_text, previous_rows)
+                for group_index, bodies in rows_by_group.items():
+                    if group_index in previous_failed or group_index in preserved:
+                        continue
+                    i = group_index - 1
+                    if not 0 <= i < n or len(bodies) != len(paragraph_groups[i]):
+                        reusable = False
+                        break
+                    checked = [validate_candidate(
+                        member["text"], body, validation_policy_for(member["text"], policy),
+                        validation_glossary)
+                        for member, body in zip(paragraph_groups[i], bodies)]
+                    if not all(candidate.ok for candidate in checked):
+                        continue
+                    out_paragraphs[i] = bodies
+                    out[i] = "\n\n".join(bodies)
+                    previous_reused.add(i)
+                    n_cached += 1
+                if previous_reused:
+                    sys.stderr.write(
+                        f"[resume] reused {len(previous_reused)}/{n} "
+                        "validated groups from previous report; "
+                        f"retrying {len(previous_failed)} failed group(s)\n")
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            # A malformed/stale report is evidence only; fall back to the
+            # ordinary per-request cache validation below.
+            previous_reused.clear()
+    def remember_parts(i, fragment, reply):
+        if not fragment or "paragraphs" not in fragment:
+            return
+        try:
+            bodies = paragraphs.parse_response(reply, fragment["paragraphs"])
+        except ValueError:
+            return  # No salvage from ambiguous/missing/reordered envelopes.
+        for part, body in zip(fragment["paragraphs"], bodies):
+            fragment_cache.put(part["text"], "paragraph-piece", body,
+                lambda value, part=part: validate_candidate(
+                    part["text"], value, validation_policy_for(part["text"], policy),
+                    validation_glossary),
+                {"request_sha256": records[i]["request_sha256"], "run_id": journal.run_id})
+
     for i, block in enumerate(blocks):
+        if i in previous_reused:
+            continue
         members = paragraph_groups[i] if paragraph_groups is not None else None
         if members is not None:
             out_paragraphs[i] = [p["text"] for p in members]
@@ -830,10 +1035,37 @@ def main():
                                    a.think, a.source_lang) for f in fragments]
         key = request_identity(block, config, fragments, messages)
         cache = Path(a.cache_dir) / (key + ".json")
+        # Dense paragraph-protocol groups (most notably the back-of-book
+        # index) can be short in source characters but large after every
+        # paragraph ID and boundary is repeated.  Keep the requested
+        # group_chars/split_chars settings and all existing cache identities,
+        # but split only a *new* dense group before its first model call.  This
+        # prevents a 3--7k-token protocol envelope from spending the full
+        # HTTP timeout while leaving the normal book plan untouched.
+        if (members is not None and len(members) >= 20
+                and a.split_chars and not cache.exists()):
+            dense_limit = max(120, a.split_chars // 6)
+            dense_fragments = plan_translation_fragments(
+                block, dense_limit, members)
+            if len(dense_fragments) > len(fragments):
+                fragments = dense_fragments
+                messages = [
+                    build_messages(
+                        f["text"], a.mode, a.target_lang,
+                        select_glossary(f["text"], glossary, glossary_profile),
+                        a.think, a.source_lang)
+                    for f in fragments
+                ]
+                key = request_identity(block, config, fragments, messages)
+                cache = Path(a.cache_dir) / (key + ".json")
+                sys.stderr.write(
+                    f"[{i + 1}/{n}] dense paragraph group; "
+                    f"planned {len(fragments)} smaller request(s)\n")
         records[i] = {"request_sha256": key, "fragments": fragments}
-        if cache.exists():
+        cache_hit = False
+        for cache_entry in group_entries(cache):
             try:
-                entry = json.loads(cache.read_text(encoding="utf-8"))
+                entry = json.loads(cache_entry.read_text(encoding="utf-8"))
                 pieces = entry["pieces"]
                 valid = (entry.get("schema") == REQUEST_VERSION
                          and entry.get("request_sha256") == key
@@ -842,6 +1074,15 @@ def main():
                 if valid:
                     checked = [validate_fragment(f, p, policy, validation_glossary)
                                for f, p in zip(fragments, pieces)]
+                    # A rejected group can still contain intact earlier requests.
+                    for f, p in zip(fragments, pieces):
+                        remember_parts(i, f, p)
+                    # Preserve those immediately before deciding the whole group.
+                    for f, candidate in zip(fragments, checked):
+                        if candidate.ok:
+                            fragment_cache.put(f["text"], "request", candidate.text,
+                                lambda value, f=f: validate_fragment(f, value, policy, validation_glossary),
+                                {"group_cache": str(cache_entry), "request_sha256": key})
                     result, bodies = assemble_translation(block, fragments,
                         [v.text for v in checked], policy, validation_glossary, members)
                     valid = (all(v.ok for v in checked) and result.ok
@@ -851,11 +1092,14 @@ def main():
                     out_paragraphs[i] = bodies
                     n_cached += 1
                     sys.stderr.write(f"[{i + 1}/{n}] cache (revalidated)\n")
-                    continue
+                    cache_hit = True
+                    break
             except (ValueError, KeyError, TypeError, OSError):
                 pass
             # Old/invalid entries remain as evidence, never delete the cache.
             sys.stderr.write(f"[{i + 1}/{n}] cache miss (policy/identity)\n")
+        if cache_hit:
+            continue
         jobs.append((i, block, cache))
 
     lock = threading.Lock()
@@ -864,27 +1108,47 @@ def main():
     failed = []                 # машиночитаемый след «keeping source»
     abort = threading.Event()   # сервер мёртв: стоп, а не сотни «keeping source»
 
-    def translate_chunk(i, block, fragment=None):
+    def translate_chunk(i, block, fragment=None, attempt_limit=3):
         selected_glossary = select_glossary(block, glossary, glossary_profile)
         messages = build_messages(block, a.mode, a.target_lang, selected_glossary,
                                   a.think, a.source_lang)
         why = "unknown"
-        for attempt in range(3):
+        dense_protocol = bool(
+            fragment and len(fragment.get("paragraphs") or []) >= 5)
+        # Index/list fragments carry repeated paragraph IDs.  Their source is
+        # short, but the protocol envelope makes a generous output cap very
+        # slow on the local Hy-MT2 server.  These fragments are kept small by
+        # the dense-group planner; a lower cap prevents a runaway response,
+        # while the strict validator rejects truncation and triggers the
+        # resumable retry path.
+        reply_cap = 768 if dense_protocol else 4096
+        for attempt in range(attempt_limit):
             try:
+                reply_tokens = min(
+                    reply_cap,
+                    output_tokens_for(messages, a.context_per_request,
+                                      requested=reply_cap),
+                )
                 with journal.attempt(context={"block_index": i + 1, "retry": attempt + 1,
                         "fragment_sha256": sha_text(block),
                         "request_sha256": records[i]["request_sha256"]}) as trace:
-                    estimate = check_messages(messages, a.context_per_request)
+                    estimate = check_messages(
+                        messages, a.context_per_request,
+                        reply_tokens=reply_tokens)
                     trace.event("budget", estimated_tokens=estimate,
                                 context_per_request=a.context_per_request)
-                    model_before = check_managed_model(a.host, a.model, messages, a.context_per_request,
-                                                       phase="before")
-                    reply = call_api(a.host, a.model, messages, a.temperature, a.top_p)
+                    model_before = check_managed_model(
+                        a.host, a.model, messages, a.context_per_request,
+                        phase="before", reply_tokens=reply_tokens)
+                    reply = call_api(a.host, a.model, messages, a.temperature,
+                                     a.top_p, max_tokens=reply_tokens)
                     check_managed_model(a.host, a.model, messages, a.context_per_request,
-                                        phase="after", previous=model_before)
+                                        phase="after", previous=model_before,
+                                        reply_tokens=reply_tokens)
                     candidate = validate_fragment(fragment or {"text": block}, reply, policy, validation_glossary)
                     trace.validation(candidate.ok, reasons=candidate.reasons,
                                      candidate_text=candidate.text, repaired=candidate.repaired)
+                    remember_parts(i, fragment, reply)
                 if candidate.ok:
                     return candidate.text, "repaired" if candidate.repaired else "ok"
                 why = "; ".join(candidate.reasons)
@@ -897,14 +1161,38 @@ def main():
                 elif any("paragraph" in r for r in candidate.reasons):
                     messages = build_messages(block, a.mode, a.target_lang, selected_glossary,
                                               a.think, a.source_lang, SCOPE_RETRY_HINT)
-            except ManagedModelError as exc:
+            except ContextLimitError as e:
+                why = "request failed: context limit"
+                reply_cap = max(256, reply_cap // 2)
+                time.sleep(1)
+            except (ManagedModelError, RequestBudgetError) as exc:
                 why = "managed model refused: " + str(exc)
                 with lock:
                     attempts.setdefault(i + 1, []).append({"attempt": attempt + 1, "reason": why})
                     sys.stderr.write(f"[{i + 1}/{n}] {why}; no automatic retry\n")
                 abort.set()
                 return None, why
-            except (urllib.error.URLError, OSError, KeyError, IndexError, TypeError,
+            except urllib.error.HTTPError as exc:
+                why = f"request failed: HTTP {exc.code}"
+                if 400 <= exc.code < 500 and exc.code not in (408, 429):
+                    with lock:
+                        attempts.setdefault(i + 1, []).append({"attempt": attempt + 1, "reason": why})
+                        sys.stderr.write(f"[{i + 1}/{n}] {why}; no automatic retry\n")
+                    abort.set()
+                    return None, why  # Permanent API/configuration error, not a retry loop.
+                time.sleep(2)
+            except urllib.error.URLError as exc:
+                reason = getattr(exc, "reason", None)
+                if isinstance(reason, ConnectionRefusedError):
+                    why = "endpoint unavailable: connection refused"
+                    with lock:
+                        attempts.setdefault(i + 1, []).append({"attempt": attempt + 1, "reason": why})
+                        sys.stderr.write(f"[{i + 1}/{n}] {why}; no automatic retry\n")
+                    abort.set()
+                    return None, why
+                why = "request failed: URLError"
+                time.sleep(2)
+            except (ConnectionError,
                     TimeoutError, ValueError, http.client.HTTPException) as e:
                 why = f"request failed: {type(e).__name__}"
                 if "ValueError" in why:
@@ -917,6 +1205,58 @@ def main():
         # Preserve the user's short-but-kept fix: never return a rejected reply.
         return None, why
 
+    def translate_fragment(i, fragment):
+        with fragment_cache.claim(fragment["text"], "request"):
+            return produce_fragment(i, fragment)
+
+    def produce_fragment(i, fragment):
+        check = lambda value: validate_fragment(fragment, value, policy, validation_glossary)
+        cached = fragment_cache.get(fragment["text"], "request", check)
+        if cached is not None:
+            return cached, "fragment cache"
+        parts = fragment.get("paragraphs") or []
+        bodies = []
+        for part in parts:
+            bodies.append(fragment_cache.get(part["text"], "paragraph-piece",
+                lambda value, part=part: validate_candidate(
+                    part["text"], value, validation_policy_for(part["text"], policy), validation_glossary)))
+        split_policy = {"validator": VALIDATOR_VERSION, "policy": asdict(policy)}
+        split_required = (len(parts) > 1 and fragment_cache.split_required(
+            fragment["text"], split_policy))
+        if not parts or (not any(body is not None for body in bodies) and not split_required):
+            # Try a batch once; a structural rejection then becomes individual
+            # paragraph work. Good bodies from a rejected batch are checkpointed.
+            piece, why = translate_chunk(i, fragment["text"], fragment,
+                                        attempt_limit=1 if len(parts) > 1 else 3)
+            if piece is not None:
+                fragment_cache.put(fragment["text"], "request", piece, check,
+                    {"request_sha256": records[i]["request_sha256"], "run_id": journal.run_id})
+                return piece, why
+            if len(parts) <= 1 or abort.is_set() or why.startswith("request failed"):
+                return None, why
+            fragment_cache.require_split(fragment["text"], split_policy)
+        pieces = []
+        for part in parts:
+            validate = lambda value, part=part: validate_candidate(
+                part["text"], value, validation_policy_for(part["text"], policy), validation_glossary)
+            body = fragment_cache.get(part["text"], "paragraph-piece", validate)
+            if body is None:
+                # The paragraph's identity is held locally; the model translates
+                # only its text, avoiding long envelope copying on the repair path.
+                body, why = translate_chunk(i, part["text"], {"text": part["text"]})
+                if body is None:
+                    return None, why
+                fragment_cache.put(part["text"], "paragraph-piece", body, validate,
+                    {"request_sha256": records[i]["request_sha256"], "run_id": journal.run_id})
+            pieces.append(body)
+        combined = paragraphs.encode(parts, pieces)
+        checked = check(combined)
+        if not checked.ok:
+            return None, "; ".join(checked.reasons)
+        fragment_cache.put(fragment["text"], "request", checked.text, check,
+            {"request_sha256": records[i]["request_sha256"], "run_id": journal.run_id})
+        return checked.text, "fragment assembly"
+
     def work(job):
         i, block, cache = job
         if abort.is_set():
@@ -926,7 +1266,7 @@ def main():
         for fragment in fragments:
             if fragment["oversized"]:
                 sys.stderr.write(f"[{i + 1}/{n}] indivisible request: {len(fragment['text'])} chars\n")
-            piece, why = translate_chunk(i, fragment["text"], fragment)
+            piece, why = translate_fragment(i, fragment)
             if piece is None:
                 break
             pieces.append(piece)
@@ -960,7 +1300,7 @@ def main():
                 consec_fail[0] = 0
                 sys.stderr.write(f"[{done[0]}/{n}] ok\n")
         if ru is not None:
-            write_json(cache, {"schema": REQUEST_VERSION,
+            save_group(cache, {"schema": REQUEST_VERSION,
                               "request_sha256": records[i]["request_sha256"],
                               "config_sha256": config_hash, "pieces": pieces,
                               "response": ru, "response_sha256": sha_text(ru),
@@ -1025,6 +1365,7 @@ def main():
         "preserved_source": len(allowed_source), "allowed_source": allowed_source,
         "paragraph_coverage": paragraph_coverage,
         "aborted": abort.is_set(), "attempts": attempts,
+        "fragment_cache": {"reused": fragment_cache.reused, "saved": fragment_cache.saved},
         "requests": {str(i + 1): row for i, row in records.items()},
         "semantic_review": "not_run"})
     if abort.is_set():

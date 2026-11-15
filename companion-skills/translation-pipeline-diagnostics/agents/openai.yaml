@@ -1,0 +1,4 @@
+interface:
+  display_name: "Диагностика перевода"
+  short_description: "Поиск причин сбоев и повторной работы конвейера"
+  default_prompt: "Используй $translation-pipeline-diagnostics, чтобы проверить состояние задания и определить безопасный следующий шаг."
