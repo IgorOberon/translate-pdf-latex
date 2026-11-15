@@ -1,93 +1,78 @@
 ---
 name: local-llm-lmstudio
-description: Operate local LLMs through LM Studio's OpenAI-compatible server reliably. Use this skill whenever the user runs models locally via LM Studio (or a similar llama.cpp server), calls http://localhost:1234, mentions GGUF/quantization/VRAM/GPU offload, complains that local inference is slow or the server is unreachable, asks how much context fits in memory, batch-processes text through a local model, or coordinates GPU memory between an LLM and another GPU tool (OCR, extraction, training). Russian phrasings that must trigger it too — «локальная модель не отвечает», «LM Studio не видит модель», «сервер недоступен», «почему так медленно генерирует», «сколько контекста влезет в видеопамять». Apply it proactively when writing any script that talks to a local model server.
+description: >-
+  Diagnose and operate a user's local LM Studio or compatible LLM endpoint.
+  Use for unavailable servers, request/context failures, slow generation,
+  parallelism or GPU memory contention. Preserve the selected model and
+  unrelated processes; distinguish cached work from work needing an API call.
 ---
 
-# Local LLM via LM Studio — field manual
+# Local model operation from observed evidence
 
-## Talking to the server (the parts that bite)
+Read the active project's instructions and settings. Identify the endpoint,
+exact requested model, model instance when available, interpreter and processes
+belonging to this job. Use the current project's runtime adapter; old probe or
+translator scripts shipped beside this skill are not an authoritative engine.
 
-- Endpoint: `http://127.0.0.1:1234/v1/chat/completions` (OpenAI schema).
-  Health check: GET `/v1/models` — the `id` field there is the exact `model`
-  string. Ready-made: `python scripts/server_probe.py [--host …]` (stdlib,
-  bypasses the system proxy, prints the ids, and on 10054/refused prints the
-  exact cure from this skill).
-- **Bypass system proxies for localhost.** VPN/antivirus proxies intercept
-  `localhost` and drop connections (WinError 10054). In Python:
-  ```python
-  opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-  ```
-  and prefer `127.0.0.1` over `localhost` in URLs.
-- Send only what the server honors: `model`, `messages`, `temperature`, `top_p`,
-  `max_tokens`. Things like top_k / repeat penalty are set in the LM Studio UI —
-  set them in **My Models -> gear** so they persist as the model's DEFAULTS
-  (JIT/auto-load uses defaults, not whatever you clicked once in a chat tab).
-- Server keeps running with zero models loaded; requests can JIT-load by model id.
-  If JIT fails ("model not found"), load manually once and retry the same call.
-- For long unattended runs: raise Max idle TTL (e.g. 720 min) in Developer settings.
+## Establish whether the server is needed
 
-## Prompting specialized models (hard-won)
+In translate-pdf-latex, start with `scripts/pipeline.py status JOB` or
+`scripts/diagnose_pipeline.py JOB`. These are read-only and do not call the model.
+A fully cached translation or completed build can be revalidated offline. Do not
+start or reload a model merely to examine progress or reuse accepted artifacts.
 
-- **Fixed-template models** (machine-translation, rerankers, etc.) treat everything
-  after their trained instruction line as PAYLOAD. Never insert glossaries, rules or
-  few-shots between the instruction and the text — the model will process them as
-  content (e.g. translate your glossary line by line, at 2000 wasted tokens per call).
-  Put auxiliary material in the **system** message; keep the user message exactly
-  on-template: `<instruction>\n\n<payload>`.
-- **Hybrid thinking models** (Hunyuan, Qwen3 family): reasoning mode silently
-  generates hundreds of hidden tokens per call. For bulk deterministic work,
-  disable it — prefix the user message with `/no_think` (and/or the UI's
-  Reasoning toggle). 10–20x speedups are typical.
-- Diagnose slowness with the Developer tab log, not vibes: each response shows
-  `prompt_tokens` / `completion_tokens`. Healthy bulk task: completion ≈ size of the
-  expected answer. If completion is 10x that — the model is thinking, echoing your
-  prompt scaffolding, or looping (raise repeat penalty ~1.05–1.1).
+When an uncached request is needed, check the selected server's model catalogue
+and current logs. An advertised maximum context is not proof of the loaded
+instance's context. If the endpoint is managed by the project, use its receipt
+and native model checks before/after generation; an absent or changed instance
+must not silently accept a reply from another model.
 
-## Throughput
+For compatible local HTTP, bypass system proxies and retain the project's
+loopback/redirect checks. Do not disable them to work around connection errors.
+Use the user's configured URL; localhost versus 127.0.0.1 may matter during
+diagnosis, but changing a saved endpoint is a configuration change. Credentials
+belong in the supported environment variable, not saved commands or logs.
 
-- LM Studio serves N parallel slots (badge `Parallel N` on the loaded model).
-  A sequential client wastes them; 3 concurrent requests ≈ 3x throughput on
-  batchable work. Caveat: context may be shared/split across slots — if long
-  prompts start failing only under parallelism, raise context or drop to 1.
-- Expected speeds (sanity anchors, 7–8B Q8 on a 16 GB consumer GPU):
-  generation 35–55 tok/s, prompt eval thousands tok/s. An order of magnitude
-  below that = model on CPU or in system-RAM spillover (see below).
+## Classify before retrying
 
-## VRAM choreography (the #1 cause of "it hangs")
+| Evidence | Next step |
+|---|---|
+| Connection refused / server absent | Check the intended server, then resume; preserve caches |
+| HTTP 400/401/403/404 | Inspect the response and configuration; retries do not repair a malformed request or missing authorization |
+| Context refusal | Inspect the actual request plus output reserve and loaded context; do not infer capacity from VRAM alone |
+| HTTP 408/429 or transient 5xx | Use bounded delays/retries; preserve successful requests |
+| Truncated/refused response | Reject it and inspect output cap or model behavior; never declare it complete |
+| Windows memory/commit error | Check process ownership, commit and available memory before changing inference settings |
+| Disk/permission failure while saving | Resolve local storage; do not repeat the model call as network recovery |
 
-- One GPU = one heavyweight at a time. LLM in LM Studio (~9 GB for 7B Q8 + cache)
-  and a GPU extraction/OCR tool do NOT coexist on 16 GB. Eject the model before the
-  other tool runs; JIT reloads it afterwards.
-- Read the other tool's startup line: `gpu_memory: 16 GB, batch_size: 8` = healthy;
-  `gpu_memory: 1 GB, batch_size: 1` = starved, will be 10–70x slower and may hit
-  internal timeouts.
-- **Windows "Shared GPU memory" is the death signal.** Dedicated VRAM full is fine;
-  when Shared (= spillover into system RAM over PCIe) grows by gigabytes, everything
-  slows 10–50x and the desktop can freeze. Watch it in Task Manager -> GPU. Fixes:
-  eject the LLM, and/or cap the other tool (MinerU honors
-  `MINERU_VIRTUAL_VRAM_SIZE=8` -> smaller batches).
-- Task Manager's default GPU graphs (3D/Copy/Video) do NOT show CUDA compute —
-  switch a graph to "Cuda" or trust `nvidia-smi`. "GPU 1%" during heavy inference
-  is usually a lie of the wrong graph.
-- KV-cache budget: for 7–9B models roughly **0.1–0.15 GB per 1000 tokens of
-  context** (fp16), RESERVED at load time for the whole declared window. 8K ≈ 1 GB,
-  32K ≈ 3–4 GB, 128K won't fit next to the weights on 16 GB. Don't declare context
-  you don't need; K/V cache quantization (q8) halves it if you must go long.
+An HTTP status alone does not prove memory exhaustion or a bad prompt. Record
+which observation supports the cause. In this pipeline `pipeline_queue.py`
+provides bounded orchestration; it is not an invitation to wrap `run` in an
+unlimited shell loop. Never substitute another provider/model after failure.
 
-## Console gotchas during long runs (Windows)
+## Tune only from measurements
 
-- A stray mouse click puts the console into QuickEdit select mode and PAUSES the
-  program until Enter. Disable QuickEdit in console properties for unattended runs.
-- Progress counters freezing while GPU stays busy = display problem, not compute;
-  counters freezing AND GPU at zero = actually stalled.
-- The machine must not sleep; display off is fine.
+For a comparable representative sample record context, generation settings,
+parallel requests, prompt/output tokens, total elapsed time, accepted output and
+retry rate. Compare useful throughput and correctness. Changing parallel from
+1 to 3 does not establish a threefold gain. Keep per-request context explicit;
+do not assume slots divide a shared context or each receives the advertised
+maximum without runtime evidence. Token estimates are estimates, not a tokenizer.
 
-## Companion skills
+Check the configured model template and supported reasoning controls before
+changing them. A model-specific switch is not universal. Long outputs may be
+reasoning, echoed instructions, repetition, or a legitimately long translation.
+Use recorded usage/finish reasons to distinguish them. Small requests need a
+reasonable output reserve, but a short cap is never permission to accept truncation.
 
-- **transcribe-seminar** — long DETACHED GPU jobs on Windows that must outlive
-  the agent session; also the coexistence trick when a foreign/elevated process
-  holds the GPU (`[Insufficient Permissions]`, unkillable): run your own job in
-  a lighter compute type (e.g. int8_float16) instead of fighting for the card.
-- **local-mt-batch** — bulk translation through this server done right.
-- **pdf-book-extraction** — the other GPU heavyweight this server must
-  time-share with (eject/JIT choreography).
+GPU load and VRAM allocation are diagnostic signals, not progress counters.
+Check appropriate compute metrics and system memory pressure. Use the project's
+ownership-aware handoff for OCR/MT. Do not routinely run `lms unload --all`, kill
+all Python processes or terminate another project's GPU work. Release only a
+known job-owned resource within the user's authorized scope; otherwise coordinate.
+Do not reintroduce historical HOLD, owner-reservation or cross-chat ACK rules
+that the user/project has revoked.
+
+For unattended operation use the project's supported background launcher and
+read its status. Console lifetime, OS sleep and display state are separate from
+model health. Do not change global power/runtime settings merely to inspect a job.
