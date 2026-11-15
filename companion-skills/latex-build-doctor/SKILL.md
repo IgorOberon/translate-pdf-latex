@@ -1,86 +1,71 @@
 ---
 name: latex-build-doctor
-description: Diagnose and fix LaTeX/XeLaTeX/MiKTeX compilation failures fast. Use this skill whenever a LaTeX build fails, produces a tiny/corrupt PDF, dies silently, spams "Undefined control sequence", cannot find fonts or .sty packages, when latexmk errors about perl, when pandoc-generated .tex does not compile, or when the user mentions main.log, Overfull hbox, MiKTeX, XeLaTeX, or "PDF не собирается". Also use it proactively before assembling any pandoc to LaTeX to PDF pipeline to apply the known-good preamble fixes.
+description: >-
+  Diagnose LaTeX, XeLaTeX or MiKTeX build failures, stale or incomplete PDFs,
+  missing fonts/glyphs, broken references and figure acceptance failures.
+  Preserve completed outputs and valid build checkpoints; repair the earliest
+  supported cause and verify the resulting candidate before publication.
 ---
 
-# LaTeX Build Doctor
+# LaTeX build recovery without losing accepted work
 
-Battle-tested triage for XeLaTeX/MiKTeX builds (Windows-first, applies to TeX Live too).
+Locate the actual build directory, command, engine log and release receipt.
+Read project instructions first. In translate-pdf-latex use its existing
+`scripts/build_release.py` and `scripts/pipeline.py`; do not replace these with
+historical helper scripts or a direct shell loop over the finished book.
 
-## Triage workflow (always start here)
+## Read the first useful error
 
-1. Get the REAL error, not the symptom:
-   ```powershell
-   Select-String -Path .\main.log -Pattern "^!" | Select-Object -First 8
-   ```
-   Lines starting with `!` are fatal. The FIRST one is the killer; the rest are often cascade.
-   With `-file-line-error` flag, errors read `file.tex:LINE: message` — use it:
-   ```
-   xelatex -interaction=nonstopmode -file-line-error main.tex
-   ```
-2. If main.log has no `!` lines but the run died before typesetting: the ENGINE failed,
-   not TeX. Look at the MiKTeX engine log instead:
-   `%LOCALAPPDATA%\MiKTeX\miktex\log\xelatex.log` (tail 25). Beware: this log is SHARED
-   by all projects on the machine — check the working directory in its lines matches
-   your project before trusting it.
-3. A "successful" PDF of 10–15 KB is a corpse from an aborted run. Never trust
-   file-exists as success. Delete stale artifacts before rebuilding:
-   ```powershell
-   del main.pdf, main.aux, main.toc -ErrorAction SilentlyContinue
-   ```
-4. TeX gives up after 100 errors ("That makes 100 errors; please try again").
-   One systematic per-instance error (e.g., an undefined macro wrapping every image)
-   kills the whole build early. Fix the class of error, not instances.
+The first fatal message usually explains later cascades. With file-line errors,
+look for `file.tex:line: message` as well as `!`. Use the project's `tex_logs.py`
+reader: logs may be UTF-8, BOM-marked or UTF-16. If TeX never started, inspect the
+engine's stderr and OS exit code. A shared MiKTeX log must be matched to this
+project and time; unrelated entries are not evidence for this failure.
 
-## Failure catalog (symptom -> cause -> fix)
+A PDF existing, a plausible byte size, or `Output written` alone is not success.
+A small PDF can also be perfectly valid. Check the process result, committed
+build state, log, actual pages, references and mandatory release acceptance.
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `latexmk ... could not find the script engine 'perl'` | MiKTeX ships latexmk wrapper without Perl | run `xelatex` directly, twice (or thrice with TOC); Strawberry Perl optional |
-| Silent death, tiny PDF, `File 'X.sty' not found` + `Emergency stop` | MiKTeX cannot auto-install packages in nonstopmode | MiKTeX Console **as normal user, NOT admin** (two separate modes!) -> Settings -> install missing packages on-the-fly: **Always**; then one interactive `xelatex main.tex` to let it download |
-| `Undefined control sequence \pandocbounded` (x hundreds) | pandoc 3.x wraps every image in its template macro; you compiled a fragment without the template | add `\providecommand{\pandocbounded}[1]{#1}` |
-| `Missing number, treated as zero` + `Illegal unit` at table cells `\begin{minipage}[b]{\linewidth}` or `p{(\columnwidth - N\tabcolsep) * \real{r}}` | pandoc table column arithmetic needs the **calc** package | `\usepackage{calc}` (then `\real` is calc's own; a `\providecommand{\real}[1]{#1}` fallback is harmless AFTER calc) |
-| `Environment Shaded undefined` / `Highlighting` / `\KeywordTok` | pandoc syntax-highlighting macros live in its standalone template | pandoc `--no-highlight` for fragments, or emit with `-s` |
-| `Undefined control sequence \mathscr` | script math alphabet not loaded | `\usepackage{mathrsfs}` |
-| `fontspec Error: The font "CMU Serif" cannot be found` | font not installed (Windows has no Computer Modern Unicode) | swap to installed fonts: `\setmainfont{Times New Roman}` `\setsansfont{Arial}` `\setmonofont{Consolas}` |
-| `Missing $ inserted` inside a filename/path being typeset | `_` `%` `&` in text mode | wrap with `\detokenize{...}` (prints verbatim, catcode-safe) |
-| `Extra alignment tab has been changed to \cr` | a row has more `&` than the array/table colspec | fix that row (often OCR noise in a formula: replace stray `&` with `\;`) |
-| `Unable to load picture or PDF file` on an EXISTING .jpg; log says "type bmp" / "not recognized" | exotic JPEG (CMYK or progressive) — viewers open it, xdvipdfmx refuses | re-encode to baseline RGB (Pillow: `Image.open(p).convert("RGB").save(p,"JPEG",progressive=False)`) |
-| Figures overflow page (`Overfull \hbox (500+pt)` at image lines) | images inserted at natural size | fit-to-page wrapper, see snippet below |
-| Missing figure kills the build | `\includegraphics` on absent file is fatal | safe wrapper below turns it into a framed note instead |
-| Overfull/Underfull hbox, a few pt | cosmetic line-breaking complaints | ignore; not errors |
-| `! LaTeX Error: File 'lmodern.sty' not found` from pandoc `-s` | pandoc default template wants lmodern | install it, or bypass template: compile fragment with your own preamble |
-| engine dies pre-typesetting on a machine where it USED to work | corrupted MiKTeX format/filename database | `initexmf --update-fndb` then `initexmf --dump=xelatex` |
+## Preserve checkpoints and distinguish fixes from retries
 
-## Known-good preamble block (Russian docs with math, XeLaTeX)
+Do not delete `main.pdf`, `.aux`, `.toc`, caches or logs as a routine remedy.
+An interrupted pass must not overwrite the last successful checkpoint. The
+pipeline uses separate pass directories and verifies source/dependency hashes
+before resuming. Completed builds are reusable only while inputs, PDF and log
+still match their receipts. A changed font/package can require a new candidate.
 
-Paste-ready fixes distilled from real builds; safe to include always. The full
-block lives in **`assets/preamble-ru-fixes.tex`** — copy it into the preamble or
-`\input` it. It bundles: system fonts (Times New Roman / Arial / Consolas),
-polyglossia russian+english, `amsmath`+`mathrsfs`, the pandoc-fragment
-provisions (`\tightlist`, `\pandocbounded`, **calc** + `\real`), and an
-`\includegraphics` wrapper that shrinks oversized figures to the page and turns
-MISSING figures into a framed searchable note instead of a fatal error.
+For an unchanged interrupted candidate the standalone command is:
 
-## Compile protocol
+```text
+python scripts/build_release.py CANDIDATE/main.tex --output CANDIDATE
+```
 
-- Two passes minimum (cross-refs); **three** passes when a `\tableofcontents` was just
-  added or the document is 100+ pages (TOC shifts page numbers).
-- Success criteria: `Output written on main.pdf (N pages)` with plausible N, and file
-  size plausible for the content (images => megabytes). Verify page count, not existence.
-- Post-build image audit when figures matter: extract `\includegraphics{...}` refs from
-  the .tex, diff against the images folder; missing files under the safe wrapper appear
-  as framed notes in the PDF (searchable), not as build failures.
+Run it from the verified pipeline root with its interpreter. For a book job,
+prefer resuming through `pipeline.py run JOB` so translation and release checks
+remain connected. Never test repairs by writing into a finished user book.
 
-## Companion skills (route non-fatal problems there)
+Correct deterministic TeX/font/content problems before retrying. Repeating the
+same failed candidate without changed inputs is not a repair. If a prepared
+candidate is stale, make a new candidate and preserve the previous evidence;
+do not edit state hashes to claim it is current. Outside this pipeline, use the
+project's build tool with an isolated output directory and equivalent checks.
 
-This skill is for FATAL build failures. Route by symptom:
-- Overfull/Underfull boxes, margin spills, long running heads, rivers ->
-  **latex-running-heads-overfull** (typography polish, not errors).
-- Blurry/bitmap text, Type3 fonts, print-quality embedding, pdfLaTeX+T2A route ->
-  **latex-pdf-font-audit**.
-- LuaLaTeX transient `memory exhausted`, mismatched `\begin/\end` pairing,
-  non-Latin text inside math mode -> **translate-book-to-latex**
-  `references/pitfalls.md` (+ `scripts/compile_retry.py`, `fix_env_pairing.py`).
-- Back-of-book index build (upmendex, Cyrillic collation) -> **latex-book-index**.
-- pandoc-driven multiscript builds and their gotchas -> **markdown-to-pdf-multiscript**.
+Read [failure-cases.md](references/failure-cases.md) for supported common causes.
+Change only what the source or compiler evidence justifies. OCR-looking formula
+symbols, equation tags, table cells and footnotes are content; compare them with
+the source rather than deleting them to obtain a clean compilation.
+
+## Acceptance
+
+- Stop a pass containing `Missing character`; fix the font/math/mask cause.
+- Let the build engine check aux/ToC stabilization with a bounded number of
+  passes. Page count alone does not establish correct bookmark destinations.
+- Inspect page count, bookmarks, figure presence and bounds, retained formulas,
+  missing glyphs and unresolved references through the normal release checks.
+- Figure placeholders can be useful in a draft. They do not substitute for
+  required figures in a finished release.
+- Distinguish small layout warnings from actual margin overflow. Inspect the
+  affected pages when evidence indicates clipping; do not globally suppress logs.
+
+Technical acceptance does not certify translation meaning or publication-level
+typography. Optional deep visual/semantic editing should match the user's task.
